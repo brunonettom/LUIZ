@@ -1,0 +1,3013 @@
+"""
+Tarefa de Indicação Contextual (Contextual Cueing Task)
+
+Este programa implementa uma Tarefa de Indicação Contextual (CCT), onde participantes
+devem encontrar um alvo (letra T rotacionada) entre vários distratores (letras L rotacionadas).
+Algumas configurações são repetidas ao longo do experimento, enquanto outras são aleatórias.
+O experimento mede o tempo de reação dos participantes para avaliar o aprendizado implícito
+das configurações espaciais repetidas.
+
+Esta versão é altamente customizável - todas as configurações podem ser modificadas
+pelo avaliador através do arquivo config.py ou pela interface gráfica de configuração.
+
+Controles:
+- Mouse: Clique no alvo quando encontrá-lo
+- Esc: Encerra o experimento
+- F1: Abre menu de configuração (disponível na tela inicial)
+"""
+
+import pygame
+import sys
+import random
+import time
+import os
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import json
+import argparse
+
+# Importar módulos de configuração e renderização
+from config_manager import ConfigManager
+from stimulus_renderer import StimulusRenderer
+
+# Definir cores extras que podem não estar em config.py
+PURPLE = (128, 0, 128)     # Roxo para alguns gráficos
+
+# Processar argumentos de linha de comando
+parser = argparse.ArgumentParser(
+    description='Tarefa de Indicação Contextual (CCT)')
+parser.add_argument(
+    '--config',
+    type=str,
+     help='Caminho para arquivo de configuração')
+parser.add_argument(
+    '--edit-config',
+    action='store_true',
+     help='Editar configurações antes de iniciar')
+args = parser.parse_args()
+
+# Inicializar gerenciador de configuração
+config_file = args.config if args.config else 'config.py'
+config = ConfigManager(config_file)
+
+# Inicializar pygame
+pygame.init()
+
+# Configurações da tela
+WIDTH = config.get('SCREEN_WIDTH', 800)
+HEIGHT = config.get('SCREEN_HEIGHT', 600)
+FULLSCREEN = config.get('FULLSCREEN', False)
+if FULLSCREEN:
+    screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.FULLSCREEN)
+else:
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Tarefa de Indicação Contextual")
+
+# Carregar cores da configuração
+WHITE = config.get('WHITE', (255, 255, 255))
+BLACK = config.get('BLACK', (0, 0, 0))
+RED = config.get('RED', (255, 0, 0))
+BLUE = config.get('BLUE', (0, 0, 255))
+GREEN = config.get('GREEN', (0, 255, 0))
+GRID_COLOR = config.get('GRID_COLOR', (200, 200, 200))
+
+# Configurar fontes
+font = pygame.font.SysFont(
+    config.get(
+        'FONT_NAME', 'Arial'), config.get(
+            'FONT_SIZE', 24))
+small_font = pygame.font.SysFont(
+    config.get(
+        'FONT_NAME', 'Arial'), config.get(
+            'SMALL_FONT_SIZE', 16))
+
+# Configurações do experimento
+GRID_SIZE = config.get('GRID_SIZE', 6)
+CELL_SIZE = config.get('CELL_SIZE', 80)
+NUM_REPEATED_CONFIGS = config.get('NUM_REPEATED_CONFIGS', 12)
+NUM_NOVEL_CONFIGS = config.get('NUM_NOVEL_CONFIGS', 12)
+NUM_BLOCKS = config.get('NUM_BLOCKS', 5)
+NUM_ITEMS = config.get('NUM_ITEMS', 12)
+SHOW_GRID = config.get('SHOW_GRID', True)
+FPS = config.get('FPS', 60)
+
+# Posição inicial da grade (centralizada)
+GRID_START_X = (WIDTH - GRID_SIZE * CELL_SIZE) // 2
+GRID_START_Y = (HEIGHT - GRID_SIZE * CELL_SIZE) // 2
+
+# Configurações de estímulos
+STIM_SIZE = config.get('STIM_SIZE', 30)
+TARGET_COLOR = config.get('TARGET_COLOR', BLACK)
+DISTRACTOR_COLOR = config.get('DISTRACTOR_COLOR', BLACK)
+TARGET_TYPE = config.get('TARGET_TYPE', 'T')
+DISTRACTOR_TYPE = config.get('DISTRACTOR_TYPE', 'L')
+TARGET_ROTATIONS = config.get('TARGET_ROTATIONS', [0, 90, 180, 270])
+DISTRACTOR_ROTATIONS = config.get('DISTRACTOR_ROTATIONS', [0, 90, 180, 270])
+
+
+class Stimulus:
+    def __init__(self, stim_type, position, rotation, is_target=False):
+        self.stim_type = stim_type  # Tipo de estímulo ('T', 'L', etc.)
+        self.position = position    # Tupla (x, y) na grade
+        self.rotation = rotation    # Rotação em graus
+        self.is_target = is_target  # Indica se é um alvo
+        self.screen_pos = (
+            GRID_START_X + position[0] * CELL_SIZE + CELL_SIZE // 2,
+            GRID_START_Y + position[1] * CELL_SIZE + CELL_SIZE // 2
+        )
+
+    def draw(self):
+        """Desenha o estímulo na tela"""
+        # Criar superfície para o estímulo
+        surf = pygame.Surface((STIM_SIZE, STIM_SIZE), pygame.SRCALPHA)
+
+        # Determinar cor com base no tipo
+        color = TARGET_COLOR if self.is_target else DISTRACTOR_COLOR
+
+        # Renderizar estímulo
+        StimulusRenderer.render_stimulus(
+    self.stim_type, surf, color, STIM_SIZE)
+
+        # Rotacionar
+        surf = pygame.transform.rotate(surf, self.rotation)
+
+        # Desenhar na tela
+        rect = surf.get_rect(center=self.screen_pos)
+        screen.blit(surf, rect)
+
+    def contains_point(self, point):
+        """Verifica se um ponto está contido no estímulo (para detecção de cliques)"""
+        x, y = point
+        center_x, center_y = self.screen_pos
+        radius = STIM_SIZE // 2
+        return (x - center_x) ** 2 + (y - center_y) ** 2 <= radius ** 2
+
+
+class Configuration:
+    def __init__(self, config_id, is_repeated):
+        self.config_id = config_id
+        self.is_repeated = is_repeated
+        self.stimuli = []
+        self.target = None
+        self.generate()
+
+    def generate(self):
+        """Gera uma configuração de estímulos"""
+        # Limpar configuração anterior
+        self.stimuli = []
+
+        # Criar grade de acordo com configuração
+        grid_positions = [(x, y) for x in range(GRID_SIZE)
+                           for y in range(GRID_SIZE)]
+
+        # Aplicar margem do alvo se configurada
+        target_margin = config.get('TARGET_MARGIN', 0)
+        if target_margin > 0:
+            valid_target_positions = [(x, y) for x, y in grid_positions
+                                     if target_margin <= x < GRID_SIZE - target_margin and
+                                        target_margin <= y < GRID_SIZE - target_margin]
+        else:
+            valid_target_positions = grid_positions.copy()
+          # Verificar se queremos balancear os quadrantes
+        balanced_quadrants = config.get('BALANCED_QUADRANTS', False)
+        if balanced_quadrants and self.is_repeated:
+            # Determinar quadrante com base no ID da configuração
+            # 0: superior esquerdo, 1: superior direito, 2: inferior esquerdo,
+            # 3: inferior direito
+            quadrant = self.config_id % 4
+            half_size = GRID_SIZE // 2
+
+            if quadrant == 0:  # Superior esquerdo
+                valid_target_positions = [
+    (x, y) for x, y in valid_target_positions if x < half_size and y < half_size]
+            elif quadrant == 1:  # Superior direito
+                valid_target_positions = [
+    (x, y) for x, y in valid_target_positions if x >= half_size and y < half_size]
+            elif quadrant == 2:  # Inferior esquerdo
+                valid_target_positions = [
+    (x, y) for x, y in valid_target_positions if x < half_size and y >= half_size]
+            else:  # Inferior direito
+                valid_target_positions = [
+    (x, y) for x, y in valid_target_positions if x >= half_size and y >= half_size]
+
+        # Selecionar posição do alvo
+        if valid_target_positions:
+            target_pos = random.choice(valid_target_positions)
+            grid_positions.remove(target_pos)
+        else:
+            # Fallback se não houver posições válidas
+            target_pos = random.choice(grid_positions)
+            grid_positions.remove(target_pos)
+              # Selecionar rotação do alvo (com balanceamento, se configurado)
+        counterbalance_rotations = config.get(
+            'COUNTERBALANCE_ROTATIONS', False)
+        if counterbalance_rotations and self.is_repeated:
+            # Usar uma rotação específica com base no ID da configuração
+            rotation_idx = self.config_id % len(TARGET_ROTATIONS)
+            target_rotation = TARGET_ROTATIONS[rotation_idx]
+        else:
+            # Rotação aleatória
+            target_rotation = random.choice(TARGET_ROTATIONS)
+
+        # Criar o estímulo alvo
+        self.target = Stimulus(
+    TARGET_TYPE,
+    target_pos,
+    target_rotation,
+     is_target=True)
+        self.stimuli.append(self.target)
+
+        # Distância mínima entre alvo e distratores, se configurada
+        min_dist = config.get('MIN_TARGET_DISTRACTOR_DIST', 0)
+        if min_dist > 0:
+            # Remover posições muito próximas do alvo
+            tx, ty = target_pos
+            grid_positions = [(x, y) for x, y in grid_positions
+                             if abs(x - tx) > min_dist or abs(y - ty) > min_dist]
+
+        # Selecionar posições para os distratores
+        distractor_positions = random.sample(
+    grid_positions, min(
+        NUM_ITEMS - 1, len(grid_positions)))
+
+        # Restante para distratores
+        for pos in distractor_positions:
+            distractor_rotation = random.choice(DISTRACTOR_ROTATIONS)
+            distractor = Stimulus(DISTRACTOR_TYPE, pos, distractor_rotation)
+            self.stimuli.append(distractor)
+
+    def draw(self):
+        """Desenha toda a configuração na tela"""
+        # Desenhar todos os estímulos
+        for stimulus in self.stimuli:
+            stimulus.draw()
+
+
+class Experiment:
+    def __init__(self):
+        self.participant_id = ""
+        self.participant_demographics = {}
+        self.repeated_configs = []
+        self.trial_results = []
+        self.current_block = 0
+        self.current_trial = 0
+        self.total_trials = 0
+        # Estados: welcome, config, demographics, fixation, trial, feedback,
+        # break, end
+        self.state = "welcome"
+        self.current_config = None
+        self.trial_start_time = 0
+        self.fixation_start_time = 0
+        self.feedback_start_time = 0
+        self.fixation_duration = config.get(
+    'FIXATION_DURATION', 0.5)  # segundos
+        self.feedback_duration = config.get(
+    'FEEDBACK_DURATION', 0.5)  # segundos
+        self.show_feedback = config.get('SHOW_FEEDBACK', True)
+        self.show_progress = config.get('SHOW_PROGRESS', True)
+        self.collect_demographics = config.get('COLLECT_DEMOGRAPHICS', False)
+        self.show_accuracy_during_break = config.get(
+            'SHOW_ACCURACY_DURING_BREAK', True)
+        self.last_response_correct = False
+
+    def setup_experiment(self):
+        """Configura o experimento"""
+        # Gerar configurações repetidas
+        self.repeated_configs = [
+            Configuration(i, True) for i in range(NUM_REPEATED_CONFIGS)
+        ]
+
+        # Calcular total de trials
+        self.total_trials = (NUM_REPEATED_CONFIGS +
+                             NUM_NOVEL_CONFIGS) * NUM_BLOCKS
+
+    def get_participant_info(self):
+        """Coleta informações do participante"""
+        prompt_text = config.get(
+    'TEXT_PARTICIPANT_PROMPT',
+     "Digite seu nome ou identificador:")
+        confirm_text = config.get(
+    'TEXT_CONFIRM',
+     "Pressione ENTER para confirmar")
+
+        pygame.key.set_repeat(500, 50)  # Configurar repetição de teclas
+        input_text = ""
+        input_active = True
+
+        while input_active:
+            screen.fill(WHITE)
+
+            # Desenhar texto
+            text_surface = font.render(prompt_text, True, BLACK)
+            text_rect = text_surface.get_rect(center=(WIDTH // 2, HEIGHT // 3))
+            screen.blit(text_surface, text_rect)
+
+            # Desenhar caixa de entrada
+            input_box = pygame.Rect(
+    WIDTH // 4, HEIGHT // 2 - 20, WIDTH // 2, 40)
+            pygame.draw.rect(screen, BLACK, input_box, 2)
+
+            # Renderizar texto de entrada
+            input_surface = font.render(input_text, True, BLACK)
+            screen.blit(input_surface, (input_box.x + 5, input_box.y + 5))
+
+            # Instruções
+            inst = small_font.render(confirm_text, True, BLACK)
+            screen.blit(
+    inst,
+    (WIDTH //
+    2 -
+    inst.get_width() //
+    2,
+    HEIGHT *
+    2 //
+     3))
+
+            pygame.display.flip()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_RETURN and input_text:
+                        input_active = False
+                        self.participant_id = input_text
+                    elif event.key == pygame.K_BACKSPACE:
+                        input_text = input_text[:-1]
+                    elif len(input_text) < 20:  # Limitar tamanho
+                        if event.unicode.isalnum() or event.unicode.isspace():
+                            input_text += event.unicode
+
+        pygame.key.set_repeat()  # Desativar repetição de teclas
+
+    def show_welcome(self):
+        """Mostra tela de boas-vindas"""
+        screen.fill(WHITE)
+
+        # Título
+        title_text = config.get(
+    'TEXT_WELCOME_TITLE',
+     "Tarefa de Indicação Contextual")
+        title = font.render(title_text, True, BLACK)
+        screen.blit(title, (WIDTH // 2 - title.get_width() // 2, HEIGHT // 4))
+
+        # Instruções
+        instructions = config.get('TEXT_WELCOME_INSTRUCTIONS', [
+            "Neste experimento, você deve encontrar e clicar na letra T",
+            "entre várias letras L que aparecem na tela.",
+            "",
+            "Clique com o botão esquerdo do mouse sobre a letra T",
+            "o mais rápido possível assim que a encontrar.",
+            "",
+            "Pressione ESPAÇO para continuar."
+        ])
+
+        for i, line in enumerate(instructions):
+            text = small_font.render(line, True, BLACK)
+            screen.blit(
+    text,
+    (WIDTH //
+    2 -
+    text.get_width() //
+    2,
+    HEIGHT //
+    2 +
+    i *
+     25))
+          # Instruções de configuração e demo
+        config_text = small_font.render(
+    "F1: Acessar configurações | F2: Modo de demonstração", True, BLUE)
+        screen.blit(
+    config_text,
+    (WIDTH //
+    2 -
+    config_text.get_width() //
+    2,
+    HEIGHT -
+     40))
+
+        pygame.display.flip()
+
+        waiting = True
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_SPACE:
+                        if self.collect_demographics:
+                            self.state = "demographics"
+                        else:
+                            self.state = "fixation"
+                        waiting = False
+                    elif event.key == pygame.K_F1:
+                        # Abrir menu de configuração
+                        config.edit_gui(screen)
+                        # Recarregar configurações
+                        self.reload_config()
+                        waiting = False
+                        # Voltar para welcome
+                        self.state = "welcome"
+                    elif event.key == pygame.K_F2:
+                        # Iniciar modo de demonstração
+                        self.start_demo_mode()
+                        waiting = False
+                    elif event.key == pygame.K_ESCAPE:
+                        pygame.quit()
+                        sys.exit()
+
+    def reload_config(self):
+        """Recarrega as configurações após edição"""
+        # Atualizar variáveis locais
+        global WIDTH, HEIGHT, GRID_SIZE, CELL_SIZE, NUM_REPEATED_CONFIGS
+        global NUM_NOVEL_CONFIGS, NUM_BLOCKS, NUM_ITEMS, GRID_START_X, GRID_START_Y
+        global STIM_SIZE, TARGET_COLOR, DISTRACTOR_COLOR, TARGET_TYPE, DISTRACTOR_TYPE
+        global TARGET_ROTATIONS, DISTRACTOR_ROTATIONS, FPS
+
+        # Recarregar da configuração
+        WIDTH = config.get('SCREEN_WIDTH', 800)
+        HEIGHT = config.get('SCREEN_HEIGHT', 600)
+        GRID_SIZE = config.get('GRID_SIZE', 6)
+        CELL_SIZE = config.get('CELL_SIZE', 80)
+        NUM_REPEATED_CONFIGS = config.get('NUM_REPEATED_CONFIGS', 12)
+        NUM_NOVEL_CONFIGS = config.get('NUM_NOVEL_CONFIGS', 12)
+        NUM_BLOCKS = config.get('NUM_BLOCKS', 5)
+        NUM_ITEMS = config.get('NUM_ITEMS', 12)
+        FPS = config.get('FPS', 60)
+
+        # Recalcular posição da grade
+        GRID_START_X = (WIDTH - GRID_SIZE * CELL_SIZE) // 2
+        GRID_START_Y = (HEIGHT - GRID_SIZE * CELL_SIZE) // 2
+
+        # Estímulos
+        STIM_SIZE = config.get('STIM_SIZE', 30)
+        TARGET_COLOR = config.get('TARGET_COLOR', BLACK)
+        DISTRACTOR_COLOR = config.get('DISTRACTOR_COLOR', BLACK)
+        TARGET_TYPE = config.get('TARGET_TYPE', 'T')
+        DISTRACTOR_TYPE = config.get('DISTRACTOR_TYPE', 'L')
+        TARGET_ROTATIONS = config.get('TARGET_ROTATIONS', [0, 90, 180, 270])
+        DISTRACTOR_ROTATIONS = config.get(
+            'DISTRACTOR_ROTATIONS', [0, 90, 180, 270])
+
+        # Atualizar configurações do experimento
+        self.fixation_duration = config.get('FIXATION_DURATION', 0.5)
+        self.feedback_duration = config.get('FEEDBACK_DURATION', 0.5)
+        self.show_feedback = config.get('SHOW_FEEDBACK', True)
+        self.show_progress = config.get('SHOW_PROGRESS', True)
+        self.collect_demographics = config.get('COLLECT_DEMOGRAPHICS', False)
+        self.show_accuracy_during_break = config.get(
+            'SHOW_ACCURACY_DURING_BREAK', True)
+
+        # Reconfigurar fontes
+        global font, small_font
+        font = pygame.font.SysFont(
+    config.get(
+        'FONT_NAME', 'Arial'), config.get(
+            'FONT_SIZE', 24))
+        small_font = pygame.font.SysFont(
+    config.get(
+        'FONT_NAME', 'Arial'), config.get(
+            'SMALL_FONT_SIZE', 16))
+
+        # Recalcular o total de trials
+        self.total_trials = (NUM_REPEATED_CONFIGS +
+                             NUM_NOVEL_CONFIGS) * NUM_BLOCKS
+
+    def collect_demographic_data(self):
+        """Coleta informações demográficas do participante"""
+        fields = {
+            'age': "Idade:",
+            'gender': "Gênero:",
+            'education': "Escolaridade:",
+            'vision': "Visão normal ou corrigida?",
+        }
+
+        field_values = {}
+        current_field = list(fields.keys())[0]
+
+        input_text = ""
+
+        pygame.key.set_repeat(500, 50)  # Configurar repetição de teclas
+
+        while True:
+            screen.fill(WHITE)
+
+            # Título
+            title = font.render("Informações Demográficas", True, BLACK)
+            screen.blit(
+    title, (WIDTH // 2 - title.get_width() // 2, HEIGHT // 4))
+
+            # Campos preenchidos
+            y_offset = HEIGHT // 3
+            for field, prompt in fields.items():
+                field_text = f"{prompt} "
+                if field in field_values:
+                    field_text += field_values[field]
+
+                text_surface = small_font.render(field_text, True,
+                                                BLACK if field != current_field else BLUE)
+                screen.blit(text_surface, (WIDTH // 4, y_offset))
+                y_offset += 30
+
+            # Campo atual
+            if current_field:
+                # Desenhar caixa de entrada
+                input_box = pygame.Rect(
+    WIDTH // 4, y_offset - 30, WIDTH // 2, 30)
+                pygame.draw.rect(screen, BLACK, input_box, 2)
+
+                # Renderizar texto de entrada
+                input_surface = small_font.render(input_text, True, BLACK)
+                screen.blit(input_surface, (input_box.x + 5, input_box.y + 5))
+
+                # Instruções
+                inst = small_font.render(
+    "Pressione ENTER para confirmar", True, BLACK)
+                screen.blit(
+    inst, (WIDTH // 2 - inst.get_width() // 2, HEIGHT * 2 // 3))
+            else:
+                # Todos os campos preenchidos
+                complete = small_font.render(
+    "Pressione ESPAÇO para continuar", True, BLACK)
+                screen.blit(
+    complete,
+    (WIDTH //
+    2 -
+    complete.get_width() //
+    2,
+    HEIGHT *
+    2 //
+     3))
+
+            pygame.display.flip()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if current_field:
+                        if event.key == pygame.K_RETURN and input_text:
+                            field_values[current_field] = input_text
+                            input_text = ""
+
+                            # Avançar para o próximo campo
+                            field_list = list(fields.keys())
+                            current_index = field_list.index(current_field)
+                            if current_index < len(field_list) - 1:
+                                current_field = field_list[current_index + 1]
+                            else:
+                                current_field = None
+
+                        elif event.key == pygame.K_BACKSPACE:
+                            input_text = input_text[:-1]
+                        else:
+                            input_text += event.unicode
+                    else:
+                        # Todos os campos preenchidos
+                        if event.key == pygame.K_SPACE:
+                            self.participant_demographics = field_values
+                            self.state = "fixation"
+                            pygame.key.set_repeat()  # Desativar repetição de teclas
+                            return
+
+    def show_fixation(self):
+        """Mostra cruz de fixação"""
+        screen.fill(WHITE)
+
+        # Desenhar cruz de fixação
+        pygame.draw.line(screen, BLACK, (WIDTH // 2 - 10,
+                         HEIGHT // 2), (WIDTH // 2 + 10, HEIGHT // 2), 3)
+        pygame.draw.line(screen, BLACK, (WIDTH // 2, HEIGHT //
+                         2 - 10), (WIDTH // 2, HEIGHT // 2 + 10), 3)
+
+        pygame.display.flip()
+
+        if self.fixation_start_time == 0:
+            self.fixation_start_time = time.time()
+
+        if time.time() - self.fixation_start_time >= self.fixation_duration:
+            self.fixation_start_time = 0
+            self.state = "trial"
+            self.prepare_trial()
+
+    def prepare_trial(self):
+        """Prepara um trial"""
+        # Determinar se este é um trial repetido ou novo
+        if random.random() < 0.5 or self.current_trial >= NUM_REPEATED_CONFIGS:
+            # Trial novo
+            self.current_config = Configuration(-1, False)
+        else:
+            # Trial repetido - usar uma configuração existente
+            config_idx = self.current_trial % NUM_REPEATED_CONFIGS
+            self.current_config = self.repeated_configs[config_idx]
+
+        self.trial_start_time = time.time()
+
+    def run_trial(self):
+        """Executa um trial"""
+        screen.fill(WHITE)
+
+        # Desenhar grade (opcional)
+        if SHOW_GRID:
+            for i in range(GRID_SIZE + 1):
+                pygame.draw.line(screen, GRID_COLOR,
+                    (GRID_START_X, GRID_START_Y + i * CELL_SIZE),
+                    (GRID_START_X + GRID_SIZE * CELL_SIZE, GRID_START_Y + i * CELL_SIZE))
+                pygame.draw.line(screen, GRID_COLOR,
+                    (GRID_START_X + i * CELL_SIZE, GRID_START_Y),
+                    (GRID_START_X + i * CELL_SIZE, GRID_START_Y + GRID_SIZE * CELL_SIZE))
+
+        # Desenhar configuração atual
+        self.current_config.draw()
+
+        # Informações de progresso
+        if self.show_progress:
+            progress = f"Bloco: {self.current_block + 1}/{NUM_BLOCKS}, Trial: {
+                self.current_trial + 1}/{(NUM_REPEATED_CONFIGS + NUM_NOVEL_CONFIGS)}"
+            prog_text = small_font.render(progress, True, BLACK)
+            screen.blit(prog_text, (10, 10))
+
+        pygame.display.flip()
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                sys.exit()
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.state = "end"
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:  # Botão esquerdo
+                    # Verificar se clicou no alvo
+                    if self.current_config.target.contains_point(event.pos):
+                        response_time = time.time() - self.trial_start_time
+                        self.last_response_correct = True
+                        self.record_trial(response_time, True)
+
+                        if self.show_feedback:
+                            self.feedback_start_time = time.time()
+                            self.state = "feedback"
+                        else:
+                            self.next_trial()
+                    else:
+                        # Clicou em outro lugar
+                        clicked = False
+                        for stim in self.current_config.stimuli:
+                            if stim.contains_point(event.pos):
+                                response_time = time.time() - self.trial_start_time
+                                self.last_response_correct = False
+                                self.record_trial(response_time, False)
+                                clicked = True
+
+                                if self.show_feedback:
+                                    self.feedback_start_time = time.time()
+                                    self.state = "feedback"
+                                else:
+                                    self.next_trial()
+                                break
+
+                        # Se clicou fora de qualquer estímulo, ignorar
+                        if not clicked:
+                            pass
+
+    def show_feedback(self):
+        """Mostra feedback visual após resposta"""
+        screen.fill(WHITE)
+
+        if self.last_response_correct:
+            # Feedback positivo
+            msg = "Correto!"
+            color = GREEN
+        else:
+            # Feedback negativo
+            msg = "Incorreto"
+            color = RED
+
+        feedback_text = font.render(msg, True, color)
+        screen.blit(
+    feedback_text,
+    (WIDTH //
+    2 -
+    feedback_text.get_width() //
+    2,
+    HEIGHT //
+     2))
+
+        pygame.display.flip()
+
+        if time.time() - self.feedback_start_time >= self.feedback_duration:
+            self.next_trial()
+
+    def record_trial(self, response_time, is_correct):
+        """Registra dados de um trial"""
+        # Dados básicos do trial
+        trial_data = {
+            'participant': self.participant_id,
+            'block': self.current_block + 1,
+            'trial': self.current_trial + 1,
+            'configuration_id': self.current_config.config_id,
+            'is_repeated': self.current_config.is_repeated,
+            'response_time': round(response_time, 3),
+            'is_correct': is_correct,
+            'target_position': self.current_config.target.position,
+            'target_type': TARGET_TYPE,
+            'distractor_type': DISTRACTOR_TYPE,
+            'timestamp': datetime.now().strftime("%Y%m%d_%H%M%S.%f"),
+        }
+
+        # Adicionar dados demográficos se coletados
+        if self.participant_demographics:
+            for key, value in self.participant_demographics.items():
+                trial_data[f'demo_{key}'] = value
+
+        self.trial_results.append(trial_data)
+
+    def next_trial(self):
+        """Passa para o próximo trial"""
+        self.current_trial += 1
+
+        if self.current_trial >= NUM_REPEATED_CONFIGS + NUM_NOVEL_CONFIGS:
+            self.current_trial = 0
+            self.current_block += 1
+
+            if self.current_block < NUM_BLOCKS:
+                self.state = "break"
+            else:
+                self.state = "end"
+        else:
+            self.state = "fixation"
+
+    def show_break(self):
+        """Mostra pausa entre blocos"""
+        screen.fill(WHITE)
+
+        # Texto de pausa
+        text = font.render(f"Bloco {self.current_block} de {
+                           NUM_BLOCKS} concluído", True, BLACK)
+        text2 = font.render(
+    config.get(
+        'TEXT_BREAK',
+        "Descanse um pouco e pressione ESPAÇO para continuar"),
+        True,
+         BLACK)
+
+        screen.blit(
+    text,
+    (WIDTH //
+    2 -
+    text.get_width() //
+    2,
+    HEIGHT //
+    2 -
+     50))
+        screen.blit(text2, (WIDTH // 2 - text2.get_width() // 2, HEIGHT // 2))
+
+        # Mostrar estatísticas, se configurado
+        if self.show_accuracy_during_break and self.trial_results:
+            # Calcular estatísticas do bloco atual
+            block_results = [
+    r for r in self.trial_results if r['block'] == self.current_block]
+            if block_results:
+                correct_trials = sum(
+    1 for r in block_results if r['is_correct'])
+                accuracy = correct_trials / len(block_results) * 100
+
+                # Estatísticas de tempo
+                correct_times = [r['response_time']
+                    for r in block_results if r['is_correct']]
+                if correct_times:
+                    avg_time = sum(correct_times) / len(correct_times)
+                    stats_text = f"Acurácia: {
+    accuracy:.1f}%, Tempo médio: {
+        avg_time:.2f}s"
+                    stats = small_font.render(stats_text, True, BLUE)
+                    screen.blit(
+    stats, (WIDTH // 2 - stats.get_width() // 2, HEIGHT // 2 + 50))
+
+        pygame.display.flip()
+
+        waiting = True
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_SPACE:
+                        waiting = False
+                    elif event.key == pygame.K_ESCAPE:
+                        self.state = "end"
+                        waiting = False
+
+        self.state = "fixation"
+          def show_end(self):
+        """Mostra tela final com opções de visualização"""
+        screen.fill(BACKGROUND_COLOR)
+
+        # Texto de finalização
+        text = font.render(
+    config.get(
+        'TEXT_END',
+        "Experimento concluído! Obrigado pela sua participação."),
+        True,
+         BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+
+        screen.blit(text, (WIDTH // 2 - text.get_width() // 2, HEIGHT // 4))
+
+        # Verificar se deve mostrar resultados e visualizações
+        show_results = config.get('SHOW_RESULTS_AT_END', True)
+        if show_results and self.trial_results:
+            self.show_end_results_summary()
+
+        # Opções finais
+        options = [
+            ("R", "Ver resultados detalhados"),
+            ("V", "Ver visualizações"),
+            ("S", "Salvar e sair"),
+            ("ESPAÇO", "Sair sem ver resultados")
+        ]
+
+        y_offset = HEIGHT - 150
+        for key, desc in options:
+            option_text = small_font.render(
+    f"{key}: {desc}", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(
+    option_text,
+    (WIDTH //
+    2 -
+    option_text.get_width() //
+    2,
+     y_offset))
+            y_offset += 30
+
+        pygame.display.flip()
+
+        waiting = True
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.save_results()
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_SPACE or event.key == pygame.K_ESCAPE:
+                        waiting = False
+                    elif event.key == pygame.K_r:
+                        # Mostrar resultados detalhados
+                        self.show_detailed_results()
+                        screen.fill(BACKGROUND_COLOR)
+                        screen.blit(
+    text, (WIDTH // 2 - text.get_width() // 2, HEIGHT // 4))
+                        y_offset = HEIGHT - 150
+                        for key, desc in options:
+                            option_text = small_font.render(
+    f"{key}: {desc}", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                            screen.blit(
+    option_text, (WIDTH // 2 - option_text.get_width() // 2, y_offset))
+                            y_offset += 30
+                        pygame.display.flip()
+                    elif event.key == pygame.K_v:
+                        # Mostrar visualizações
+                        self.show_visualizations()
+                        screen.fill(BACKGROUND_COLOR)
+                        screen.blit(
+    text, (WIDTH // 2 - text.get_width() // 2, HEIGHT // 4))
+                        y_offset = HEIGHT - 150
+                        for key, desc in options:
+                            option_text = small_font.render(
+    f"{key}: {desc}", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                            screen.blit(
+    option_text, (WIDTH // 2 - option_text.get_width() // 2, y_offset))
+                            y_offset += 30
+                        pygame.display.flip()
+                    elif event.key == pygame.K_s:
+                        self.save_results()
+                        waiting = False
+
+    def show_end_results_summary(self):
+        """Mostra um resumo dos resultados no final do experimento"""
+        if not self.trial_results:
+            return
+
+        # Converter para DataFrame para análise
+        import pandas as pd
+        results_df = pd.DataFrame(self.trial_results)
+        correct_trials = results_df[results_df['is_correct']]
+
+        # Calcular estatísticas básicas
+        total_trials = len(results_df)
+        correct_count = len(correct_trials)
+        accuracy = (
+    correct_count /
+    total_trials *
+     100) if total_trials > 0 else 0
+
+        # Tempos médios para configurações repetidas e novas
+        if not correct_trials.empty:
+            repeated_rt = correct_trials[correct_trials['is_repeated']]['response_time'].mean(
+            )
+            novel_rt = correct_trials[~correct_trials['is_repeated']]['response_time'].mean(
+            )
+            overall_rt = correct_trials['response_time'].mean()
+            contextual_effect = novel_rt - repeated_rt
+        else:
+            repeated_rt = novel_rt = overall_rt = contextual_effect = 0
+
+        # Desenhar área de resultados
+        result_box = pygame.Rect(
+    WIDTH // 6,
+    HEIGHT // 3,
+    WIDTH * 2 // 3,
+     HEIGHT // 3)
+        pygame.draw.rect(
+    screen,
+    (240,
+    240,
+    240) if BACKGROUND_COLOR == WHITE else (
+        40,
+        40,
+        40),
+         result_box)
+        pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR ==
+                         WHITE else WHITE, result_box, 2)
+
+        # Título
+        title = font.render(
+    "Resumo dos Resultados",
+    True,
+     BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+        screen.blit(
+    title,
+    (WIDTH //
+    2 -
+    title.get_width() //
+    2,
+    result_box.top +
+     10))
+
+        # Resultados
+        text_color = BLACK if BACKGROUND_COLOR == WHITE else WHITE
+        results = [
+            f"Total de trials: {total_trials}",
+            f"Respostas corretas: {correct_count} ({accuracy:.1f}%)",
+            f"Tempo de reação médio: {overall_rt:.3f}s",
+            f"Tempo em configurações repetidas: {repeated_rt:.3f}s",
+            f"Tempo em configurações novas: {novel_rt:.3f}s",
+            f"Efeito de indicação contextual: {contextual_effect:.3f}s"
+        ]
+
+        # Interpretar o efeito
+        if contextual_effect > 0:
+            effect_str = f"Aprendizado implícito detectado: {
+    contextual_effect:.3f}s mais rápido em configurações repetidas"
+            effect_color = GREEN
+        else:
+            effect_str = f"Sem evidência clara de aprendizado implícito"
+            effect_color = RED if contextual_effect < -0.1 else text_color
+
+        # Adicionar linhas de resultados
+        y_offset = result_box.top + 50
+        for res in results:
+            res_text = small_font.render(res, True, text_color)
+            screen.blit(
+    res_text,
+    (WIDTH //
+    2 -
+    res_text.get_width() //
+    2,
+     y_offset))
+            y_offset += 25
+
+        # Adicionar linha de interpretação
+        effect_text = small_font.render(effect_str, True, effect_color)
+        screen.blit(
+    effect_text,
+    (WIDTH //
+    2 -
+    effect_text.get_width() //
+    2,
+    y_offset +
+     10))
+
+    def show_detailed_results(self):
+        """Mostra resultados detalhados"""
+        if not self.trial_results:
+            return
+
+        try:
+            # Importar bibliotecas para análise
+            import pandas as pd
+            import numpy as np
+            from scipy import stats
+
+            # Criar DataFrame
+            results_df = pd.DataFrame(self.trial_results)
+            correct_trials = results_df[results_df['is_correct']]
+
+            # Preparar tela
+            screen.fill(BACKGROUND_COLOR)
+            title = font.render(
+    "Resultados Detalhados",
+    True,
+     BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 20))
+
+            # Análise por bloco
+            block_data = correct_trials.groupby(['block', 'is_repeated'])[
+                                                'response_time'].agg(['mean', 'std', 'count']).reset_index()
+
+            # Tabela de resultados
+            table_rect = pygame.Rect(
+    WIDTH // 10, 60, WIDTH * 8 // 10, HEIGHT * 6 // 10)
+            pygame.draw.rect(
+    screen,
+    (240,
+    240,
+    240) if BACKGROUND_COLOR == WHITE else (
+        40,
+        40,
+        40),
+         table_rect)
+            pygame.draw.rect(
+    screen,
+    BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+    table_rect,
+     2)
+
+            # Cabeçalho
+            headers = [
+    "Bloco",
+    "Config",
+    "Tempo Médio",
+    "Desvio Padrão",
+    "# Trials",
+     "Efeito"]
+            header_widths = [80, 100, 120, 120, 80, 100]
+            header_x = table_rect.left + 20
+
+            for header, width in zip(headers, header_widths):
+                header_text = small_font.render(
+    header, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                screen.blit(header_text, (header_x, table_rect.top + 20))
+                header_x += width
+
+            # Linhas da tabela
+            y_offset = table_rect.top + 50
+            for block in range(1, NUM_BLOCKS + 1):
+                block_rows = block_data[block_data['block'] == block]
+
+                if not block_rows.empty:
+                    repeated = block_rows[block_rows['is_repeated']]
+                    novel = block_rows[~block_rows['is_repeated']]
+
+                    if not repeated.empty and not novel.empty:
+                        rep_mean = repeated['mean'].values[0]
+                        nov_mean = novel['mean'].values[0]
+                        effect = nov_mean - rep_mean
+
+                        # Linha para repetidas
+                        x_pos = table_rect.left + 20
+                        texts = [
+                            f"{block}",
+                            "Repetidas",
+                            f"{rep_mean:.3f}s",
+                            f"{repeated['std'].values[0]:.3f}",
+                            f"{int(repeated['count'].values[0])}",
+                            ""
+                        ]
+
+                        for text, width in zip(texts, header_widths):
+                            text_surf = small_font.render(
+    text, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                            screen.blit(text_surf, (x_pos, y_offset))
+                            x_pos += width
+
+                        y_offset += 25
+
+                        # Linha para novas
+                        x_pos = table_rect.left + 20
+                        texts = [
+                            f"{block}",
+                            "Novas",
+                            f"{nov_mean:.3f}s",
+                            f"{novel['std'].values[0]:.3f}",
+                            f"{int(novel['count'].values[0])}",
+                            f"{effect:.3f}s"
+                        ]
+
+                        for text, width in zip(texts, header_widths):
+                            text_surf = small_font.render(
+    text, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                            screen.blit(text_surf, (x_pos, y_offset))
+                            x_pos += width
+
+                        y_offset += 25
+
+            # Estatísticas gerais
+            y_offset = table_rect.bottom + 20
+
+            # Teste estatístico para efeito de indicação contextual
+            if len(correct_trials[correct_trials['is_repeated']]) > 1 and len(
+                correct_trials[~correct_trials['is_repeated']]) > 1:
+                t_stat, p_value = stats.ttest_ind(
+                    correct_trials[correct_trials['is_repeated']
+                        ]['response_time'],
+                    correct_trials[~correct_trials['is_repeated']
+                        ]['response_time']
+                )
+
+                stat_text = f"Teste-t para efeito de indicação contextual: t = {
+                    t_stat:.3f}, p = {p_value:.4f}"
+                stat_surf = small_font.render(
+    stat_text, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                screen.blit(
+    stat_surf, (WIDTH // 2 - stat_surf.get_width() // 2, y_offset))
+
+                sig_text = "Efeito estatisticamente significativo (p < 0.05)" if p_value < 0.05 else "Efeito não significativo (p >= 0.05)"
+                sig_color = GREEN if p_value < 0.05 else RED
+                sig_surf = small_font.render(sig_text, True, sig_color)
+                screen.blit(
+    sig_surf,
+    (WIDTH //
+    2 -
+    sig_surf.get_width() //
+    2,
+    y_offset +
+     25))
+
+            # Instruções
+            inst_text = small_font.render(
+    "Pressione qualquer tecla para voltar",
+    True,
+     BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(
+    inst_text,
+    (WIDTH //
+    2 -
+    inst_text.get_width() //
+    2,
+    HEIGHT -
+     30))
+
+            pygame.display.flip()
+
+            # Esperar tecla
+            waiting = True
+            while waiting:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.save_results()
+                        pygame.quit()
+                        sys.exit()
+                    elif event.type == pygame.KEYDOWN:
+                        waiting = False
+
+        except Exception as e:
+            print(f"Erro ao mostrar resultados detalhados: {e}")
+            # Mostrar mensagem de erro na tela
+            screen.fill(BACKGROUND_COLOR)
+            error_text = font.render(
+    f"Erro ao processar resultados: {
+        str(e)}", True, RED)
+            screen.blit(
+    error_text,
+    (WIDTH //
+    2 -
+    error_text.get_width() //
+    2,
+    HEIGHT //
+     2))
+            pygame.display.flip()
+
+            # Aguardar tecla
+            pygame.time.wait(3000)
+
+    def show_visualizations(self):
+        """Mostra visualizações dos resultados"""
+        if not self.trial_results:
+            return
+
+        try:
+            # Importar bibliotecas necessárias
+            import pandas as pd
+            import numpy as np
+            import matplotlib
+            matplotlib.use('Agg')  # Usar backend que não precisa de GUI
+            import matplotlib.pyplot as plt
+            import io
+            from PIL import Image
+
+            # Preparar dados
+            results_df = pd.DataFrame(self.trial_results)
+            correct_trials = results_df[results_df['is_correct']]
+
+            # Desenhar interface
+            screen.fill(BACKGROUND_COLOR)
+
+            # Título
+            title = font.render(
+    "Visualização de Resultados",
+    True,
+     BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 20))
+
+            # Criar visualizações disponíveis
+            visualizations = [
+                "Tempo médio por bloco",
+                "Efeito de indicação contextual",
+                "Distribuição dos tempos",
+                "Posições dos alvos (heatmap)",
+                "Voltar"
+            ]
+
+            # Desenhar botões de visualização
+            button_height = 40
+            button_width = WIDTH * 3 // 4
+            button_x = (WIDTH - button_width) // 2
+
+            selected_viz = 0
+
+            def draw_viz_buttons(selected):
+                y_offset = 70
+                for i, viz in enumerate(visualizations):
+                    button_rect = pygame.Rect(
+    button_x, y_offset, button_width, button_height)
+                    button_color = BLUE if i == selected else (
+    200, 200, 200) if BACKGROUND_COLOR == WHITE else (
+        100, 100, 100)
+                    text_color = WHITE if i == selected else (
+                        BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+
+                    pygame.draw.rect(screen, button_color, button_rect)
+                    text = small_font.render(viz, True, text_color)
+                    screen.blit(
+    text,
+    (button_rect.centerx -
+    text.get_width() //
+    2,
+    button_rect.centery -
+    text.get_height() //
+     2))
+
+                    y_offset += button_height + 10
+
+            # Área para a visualização
+            viz_rect = pygame.Rect(
+    WIDTH // 10, 300, WIDTH * 8 // 10, HEIGHT - 350)
+
+            def draw_viz_area():
+                pygame.draw.rect(
+    screen,
+    (240,
+    240,
+    240) if BACKGROUND_COLOR == WHITE else (
+        40,
+        40,
+        40),
+         viz_rect)
+                pygame.draw.rect(
+    screen,
+    BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+    viz_rect,
+     2)
+
+            # Função para renderizar gráfico Matplotlib em uma superfície
+            # Pygame
+            def plt_to_surface(fig):
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100, bbox_inches='tight',
+                           facecolor=fig.get_facecolor(), edgecolor='none')
+                buf.seek(0)
+                img = Image.open(buf)
+                mode = img.mode
+                size = img.size
+                data = img.tobytes()
+                image = pygame.image.fromstring(data, size, mode)
+
+                # Redimensionar para caber na área de visualização mantendo
+                # proporção
+                img_ratio = image.get_width() / image.get_height()
+                viz_ratio = viz_rect.width / viz_rect.height
+
+                if img_ratio > viz_ratio:
+                    # Limitado pela largura
+                    new_width = viz_rect.width
+                    new_height = int(new_width / img_ratio)
+                else:
+                    # Limitado pela altura
+                    new_height = viz_rect.height
+                    new_width = int(new_height * img_ratio)
+
+                return pygame.transform.scale(image, (new_width, new_height))
+
+            # Função para mostrar diferentes visualizações
+            def show_selected_viz(selection):
+                draw_viz_area()
+
+                if selection == 0:  # Tempo médio por bloco
+                    # Agrupar dados por bloco e tipo de configuração
+                    mean_rt_by_block = correct_trials.groupby(['block', 'is_repeated'])[
+                                                              'response_time'].mean().reset_index()
+
+                    # Separar dados por tipo de configuração
+                    repeated = mean_rt_by_block[mean_rt_by_block['is_repeated']]
+                    novel = mean_rt_by_block[~mean_rt_by_block['is_repeated']]
+
+                    # Criar plot
+                    plt.figure(
+    figsize=(
+        8,
+        6),
+         facecolor='white' if BACKGROUND_COLOR == WHITE else 'black')
+                    ax = plt.subplot(
+    111, facecolor='white' if BACKGROUND_COLOR == WHITE else 'black')
+
+                    # Definir cores baseadas no modo de fundo
+                    text_color = 'black' if BACKGROUND_COLOR == WHITE else 'white'
+                    grid_color = 'gray' if BACKGROUND_COLOR == WHITE else 'darkgray'
+
+                    # Plotar linhas
+                    rep_line, = ax.plot(repeated['block'], repeated['response_time'], 'o-',
+                                       color='blue', label='Configurações repetidas')
+                    nov_line, = ax.plot(novel['block'], novel['response_time'], 'o-',
+                                       color='red', label='Configurações novas')
+
+                    # Configurar aparência
+                    ax.set_title(
+    'Tempo médio de reação por bloco',
+    color=text_color,
+     fontsize=14)
+                    ax.set_xlabel('Bloco', color=text_color, fontsize=12)
+                    ax.set_ylabel(
+    'Tempo de resposta (s)',
+    color=text_color,
+     fontsize=12)
+                    ax.grid(True, color=grid_color, linestyle='--', alpha=0.7)
+                    ax.tick_params(colors=text_color)
+
+                    for spine in ax.spines.values():
+                        spine.set_color(text_color)
+
+                    ax.legend(handles=[rep_line, nov_line], facecolor='white' if BACKGROUND_COLOR == WHITE else 'black',
+                             edgecolor=text_color, labelcolor=text_color)
+
+                    # Converter para superfície Pygame e mostrar
+                    plot_surface = plt_to_surface(plt.gcf())
+                    screen.blit(plot_surface, (viz_rect.centerx - plot_surface.get_width() // 2,
+                                             viz_rect.centery - plot_surface.get_height() // 2))
+                    plt.close()
+
+                elif selection == 1:  # Efeito de indicação contextual
+                    # Calcular efeito por bloco
+                    effect_by_block = []
+                    for block in range(1, NUM_BLOCKS + 1):
+                        block_data = correct_trials[correct_trials['block'] == block]
+                        if len(block_data) > 0:
+                            rep_mean = block_data[block_data['is_repeated']]['response_time'].mean(
+                            )
+                            nov_mean = block_data[~block_data['is_repeated']]['response_time'].mean(
+                            )
+                            effect = nov_mean - rep_mean
+                            effect_by_block.append((block, effect))
+
+                    if effect_by_block:
+                        blocks, effects = zip(*effect_by_block)
+
+                        # Criar plot
+                        plt.figure(
+    figsize=(
+        8,
+        6),
+         facecolor='white' if BACKGROUND_COLOR == WHITE else 'black')
+                        ax = plt.subplot(
+    111, facecolor='white' if BACKGROUND_COLOR == WHITE else 'black')
+
+                        # Definir cores
+                        text_color = 'black' if BACKGROUND_COLOR == WHITE else 'white'
+                        grid_color = 'gray' if BACKGROUND_COLOR == WHITE else 'darkgray'
+
+                        # Plotar efeito
+                        ax.bar(blocks, effects, color='purple', alpha=0.7)
+                        ax.axhline(y=0, color=text_color, linestyle='--')
+
+                        # Configurar aparência
+                        ax.set_title(
+    'Efeito de indicação contextual por bloco',
+    color=text_color,
+     fontsize=14)
+                        ax.set_xlabel('Bloco', color=text_color, fontsize=12)
+                        ax.set_ylabel(
+    'Diferença no tempo de reação (s)',
+    color=text_color,
+     fontsize=12)
+                        ax.grid(
+    True,
+    color=grid_color,
+    linestyle='--',
+     alpha=0.7)
+                        ax.tick_params(colors=text_color)
+
+                        for spine in ax.spines.values():
+                            spine.set_color(text_color)
+
+                        # Converter para superfície Pygame e mostrar
+                        plot_surface = plt_to_surface(plt.gcf())
+                        screen.blit(plot_surface, (viz_rect.centerx - plot_surface.get_width() // 2,
+                                                 viz_rect.centery - plot_surface.get_height() // 2))
+                        plt.close()
+
+                elif selection == 2:  # Distribuição dos tempos
+                    # Criar histograma das distribuições
+                    plt.figure(
+    figsize=(
+        8,
+        6),
+         facecolor='white' if BACKGROUND_COLOR == WHITE else 'black')
+                    ax = plt.subplot(
+    111, facecolor='white' if BACKGROUND_COLOR == WHITE else 'black')
+
+                    text_color = 'black' if BACKGROUND_COLOR == WHITE else 'white'
+                    grid_color = 'gray' if BACKGROUND_COLOR == WHITE else 'darkgray'
+
+                    # Histogramas
+                    if 'is_repeated' in correct_trials.columns:
+                        rep_times = correct_trials[correct_trials['is_repeated']
+                            ]['response_time']
+                        nov_times = correct_trials[~correct_trials['is_repeated']
+                            ]['response_time']
+
+                        if len(rep_times) > 0 and len(nov_times) > 0:
+                            bins = np.linspace(
+                                min(rep_times.min(), nov_times.min()),
+                                max(rep_times.max(), nov_times.max()),
+                                20
+                            )
+
+                            ax.hist(
+    rep_times,
+    bins=bins,
+    alpha=0.5,
+    color='blue',
+     label='Repetidas')
+                            ax.hist(
+    nov_times,
+    bins=bins,
+    alpha=0.5,
+    color='red',
+     label='Novas')
+
+                            # Configurar aparência
+                            ax.set_title(
+    'Distribuição dos tempos de reação',
+    color=text_color,
+     fontsize=14)
+                            ax.set_xlabel(
+    'Tempo de resposta (s)', color=text_color, fontsize=12)
+                            ax.set_ylabel(
+    'Frequência', color=text_color, fontsize=12)
+                            ax.grid(
+    True, color=grid_color, linestyle='--', alpha=0.7)
+                            ax.tick_params(colors=text_color)
+
+                            for spine in ax.spines.values():
+                                spine.set_color(text_color)
+
+                            ax.legend(facecolor='white' if BACKGROUND_COLOR == WHITE else 'black',
+                                     edgecolor=text_color, labelcolor=text_color)
+
+                            # Converter e mostrar
+                            plot_surface = plt_to_surface(plt.gcf())
+                            screen.blit(plot_surface, (viz_rect.centerx - plot_surface.get_width() // 2,
+                                                     viz_rect.centery - plot_surface.get_height() // 2))
+                    plt.close()
+
+                elif selection == 3:  # Heatmap de posições
+                    # Extrair posições dos alvos para criar heatmap
+                    if 'target_position' in correct_trials.columns:
+                        try:
+                            # Preparar dados para o heatmap
+                            heatmap_data = np.zeros((GRID_SIZE, GRID_SIZE))
+                            position_counts = np.zeros((GRID_SIZE, GRID_SIZE))
+
+                            for _, trial in correct_trials.iterrows():
+                                if isinstance(
+    trial['target_position'], tuple) and len(
+        trial['target_position']) == 2:
+                                    x, y = trial['target_position']
+                                    if 0 <= x < GRID_SIZE and 0 <= y < GRID_SIZE:
+                                        heatmap_data[y,
+                                            x] += trial['response_time']
+                                        position_counts[y, x] += 1
+
+                            # Calcular médias
+                            mask = position_counts > 0
+                            heatmap_data[mask] = heatmap_data[mask] / \
+                                position_counts[mask]
+
+                            # Criar heatmap
+                            plt.figure(
+    figsize=(
+        8,
+        6),
+         facecolor='white' if BACKGROUND_COLOR == WHITE else 'black')
+                            ax = plt.subplot(111)
+
+                            cmap = plt.cm.YlOrRd
+                            im = ax.imshow(heatmap_data, cmap=cmap)
+
+                            # Adicionar valores às células
+                            for i in range(GRID_SIZE):
+                                for j in range(GRID_SIZE):
+                                    if position_counts[i, j] > 0:
+                                        text = ax.text(j, i, f"{heatmap_data[i, j]:.2f}",
+                                                     ha="center", va="center",
+                                                     color="black" if heatmap_data[i, j] < 0.7 * heatmap_data.max() else "white")
+
+                            # Configurar aparência
+                            ax.set_title('Tempo médio de reação por posição do alvo',
+                                        color='black' if BACKGROUND_COLOR == WHITE else 'white')
+                            cbar = plt.colorbar(im)
+                            cbar.set_label('Tempo de resposta (s)',
+                                          color='black' if BACKGROUND_COLOR == WHITE else 'white')
+
+                            # Converter e mostrar
+                            plot_surface = plt_to_surface(plt.gcf())
+                            screen.blit(plot_surface, (viz_rect.centerx - plot_surface.get_width() // 2,
+                                                     viz_rect.centery - plot_surface.get_height() // 2))
+                        except Exception as e:
+                            error_text = small_font.render(
+                                f"Erro no heatmap: {str(e)}", True, RED)
+                            screen.blit(
+    error_text, (viz_rect.centerx - error_text.get_width() // 2, viz_rect.centery))
+
+                    plt.close()
+
+            # Mostrar interface e controlar seleção
+            running = True
+            while running:
+                # Desenhar botões
+                draw_viz_buttons(selected_viz)
+
+                # Mostrar visualização atual
+                if selected_viz < len(visualizations) - \
+                                      1:  # Não mostrar visualização para "Voltar"
+                    show_selected_viz(selected_viz)
+
+                pygame.display.flip()
+
+                # Processar eventos
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.save_results()
+                        pygame.quit()
+                        sys.exit()
+                    elif event.type == pygame.KEYDOWN:
+                        if event.key == pygame.K_DOWN:
+                            selected_viz = (
+    selected_viz + 1) % len(visualizations)
+                        elif event.key == pygame.K_UP:
+                            selected_viz = (
+    selected_viz - 1) % len(visualizations)
+                        elif event.key == pygame.K_RETURN:
+                            if selected_viz == len(
+                                visualizations) - 1:  # "Voltar" selecionado
+                                running = False
+                        elif event.key == pygame.K_ESCAPE:
+                            running = False
+                    elif event.type == pygame.MOUSEBUTTONDOWN:
+                        # Verificar clique nos botões
+                        y_offset = 70
+                        for i in range(len(visualizations)):
+                            button_rect = pygame.Rect(
+    button_x, y_offset, button_width, button_height)
+                            if button_rect.collidepoint(event.pos):
+                                if i == len(visualizations) - \
+                                            1:  # "Voltar" clicado
+                                    running = False
+                                else:
+                                    selected_viz = i
+                            y_offset += button_height + 10
+
+        except Exception as e:
+            print(f"Erro ao mostrar visualizações: {e}")
+
+            # Mostrar mensagem de erro na tela
+            screen.fill(BACKGROUND_COLOR)
+            error_text = font.render(
+    f"Erro ao processar visualizações: {
+        str(e)}", True, RED)
+            screen.blit(
+    error_text,
+    (WIDTH //
+    2 -
+    error_text.get_width() //
+    2,
+    HEIGHT //
+     2))
+            pygame.display.flip()
+
+            # Aguardar tecla
+            waiting = True
+            while waiting:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        self.save_results()
+                        pygame.quit()
+                        sys.exit()
+                    elif event.type == pygame.KEYDOWN:
+                        waiting = False
+                        waiting = False
+
+        self.save_results()
+        pygame.quit()
+        sys.exit()
+
+    def save_results(self):
+        """Salva os resultados do experimento"""
+        # Criar diretório de resultados se não existir
+        results_dir = os.path.join(
+    os.path.dirname(
+        os.path.abspath(__file__)), config.get(
+            'RESULTS_DIR', "resultados"))
+        os.makedirs(results_dir, exist_ok=True)
+
+        # Criar dataframe
+        results_df = pd.DataFrame(self.trial_results)
+
+        # Timestamp para nome do arquivo
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"cct_participant_{self.participant_id}_{timestamp}"
+
+        # Salvar CSV
+        csv_path = os.path.join(results_dir, f"{filename}.csv")
+        results_df.to_csv(csv_path, index=False)
+
+        # Salvar também em formato JSON
+        json_path = os.path.join(results_dir, f"{filename}.json")
+        with open(json_path, 'w') as f:
+            json.dump(self.trial_results, f, indent=4, default=str)
+          # Análise avançada
+        try:
+            # Importar bibliotecas para análise e visualização
+            import matplotlib
+            matplotlib.use('Agg')  # Usar backend que não precisa de GUI
+            import matplotlib.pyplot as plt
+            import seaborn as sns
+            from scipy import stats
+
+            # Filtrar apenas trials corretos
+            correct_trials = results_df[results_df['is_correct']]
+
+            # Tempos médios por bloco e tipo de configuração
+            analysis = correct_trials.groupby(['block', 'is_repeated'])['response_time'].agg(
+                ['mean', 'std', 'count']).reset_index()
+
+            # Salvar análise em TXT
+            txt_path = os.path.join(results_dir, f"{filename}_analysis.txt")
+            with open(txt_path, 'w') as f:
+                f.write(
+                    f"ANÁLISE DA TAREFA DE INDICAÇÃO CONTEXTUAL - Participante: {self.participant_id}\n")
+                f.write("=" * 80 + "\n\n")
+                f.write("Tempos médios de resposta (segundos):\n")
+
+                repeated_data = analysis[analysis['is_repeated']].reset_index()
+                novel_data = analysis[~analysis['is_repeated']].reset_index()
+
+                f.write("\nBloco\tRepetidas\tNovas\tDiferença\tEfeito (%)\n")
+
+                for i in range(1, NUM_BLOCKS + 1):
+                    rep_time = repeated_data[repeated_data['block'] ==
+                        i]['mean'].values[0] if i in repeated_data['block'].values else 0
+                    nov_time = novel_data[novel_data['block'] ==
+                        i]['mean'].values[0] if i in novel_data['block'].values else 0
+                    diff = nov_time - rep_time
+                    effect_pct = (diff / nov_time * 100) if nov_time > 0 else 0
+                    f.write(
+    f"{i}\t{
+        rep_time:.3f}s\t{
+            nov_time:.3f}s\t{
+                diff:.3f}s\t{
+                    effect_pct:.1f}%\n")
+
+                # Estatísticas gerais
+                f.write("\n\nESTATÍSTICAS GERAIS\n")
+                f.write("=" * 80 + "\n")
+
+                # Acurácia geral
+                accuracy = len(correct_trials) / len(results_df) * 100
+                f.write(f"Acurácia geral: {accuracy:.1f}%\n")
+
+                # Tempo médio de resposta (geral, repetidas, novas)
+                mean_rt = correct_trials['response_time'].mean()
+                mean_rt_repeated = correct_trials[correct_trials['is_repeated']]['response_time'].mean(
+                )
+                mean_rt_novel = correct_trials[~correct_trials['is_repeated']]['response_time'].mean(
+                )
+
+                f.write(f"Tempo médio de resposta (geral): {mean_rt:.3f}s\n")
+                f.write(
+    f"Tempo médio de resposta (configurações repetidas): {
+        mean_rt_repeated:.3f}s\n")
+                f.write(
+    f"Tempo médio de resposta (configurações novas): {
+        mean_rt_novel:.3f}s\n")
+
+                # Teste estatístico para efeito de indicação contextual
+                t_stat, p_value = stats.ttest_ind(
+                    correct_trials[correct_trials['is_repeated']
+                        ]['response_time'],
+                    correct_trials[~correct_trials['is_repeated']
+                        ]['response_time']
+                )
+
+                f.write(
+    f"\nTeste T para diferença entre configurações repetidas e novas:\n")
+                f.write(f"t = {t_stat:.3f}, p = {p_value:.4f}\n")
+
+                if p_value < 0.05:
+                    f.write(
+    f"Resultado: Efeito de indicação contextual SIGNIFICATIVO (p < 0.05)\n")
+                else:
+                    f.write(
+    f"Resultado: Efeito de indicação contextual NÃO SIGNIFICATIVO (p > 0.05)\n")
+
+                # Análise da evolução do efeito ao longo dos blocos
+                learning_effect = []
+                for i in range(1, NUM_BLOCKS + 1):
+                    rep_time = correct_trials[(
+                        correct_trials['block'] == i) & correct_trials['is_repeated']]['response_time'].mean()
+                    nov_time = correct_trials[(
+                        correct_trials['block'] == i) & ~correct_trials['is_repeated']]['response_time'].mean()
+                    effect = nov_time - rep_time
+                    learning_effect.append(effect)
+
+                f.write(
+    f"\nEvolução do efeito de aprendizado ao longo dos blocos:\n")
+                for i, effect in enumerate(learning_effect, 1):
+                    f.write(f"Bloco {i}: {effect:.3f}s\n")
+
+            # Gerar visualizações se configurado
+            show_rt_graph = config.get('SHOW_RT_GRAPH', True)
+            if show_rt_graph:
+                # Configuração dos gráficos
+                plt.figure(figsize=(12, 10))
+                sns.set_style("whitegrid")
+
+                # Criar subplots
+                fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+
+                # Gráfico 1: Tempo médio por bloco e tipo de configuração
+                sns.lineplot(
+                    data=analysis, x='block', y='mean', hue='is_repeated',
+                    markers=True, dashes=False,
+                    palette={True: 'blue', False: 'red'},
+                    ax=ax1
+                )
+
+                # Configurar primeiro gráfico
+                ax1.set_title('Tempo médio de resposta por bloco', fontsize=14)
+                ax1.set_xlabel('Bloco', fontsize=12)
+                ax1.set_ylabel('Tempo de resposta (s)', fontsize=12)
+                ax1.set_xticks(range(1, NUM_BLOCKS + 1))
+                ax1.legend(['Configurações repetidas', 'Configurações novas'])
+
+                # Gráfico 2: Efeito de aprendizado (diferença) por bloco
+                block_nums = list(range(1, NUM_BLOCKS + 1))
+                ax2.plot(
+    block_nums,
+    learning_effect,
+    'o-',
+    color='purple',
+     linewidth=2)
+                ax2.set_title(
+    'Efeito de indicação contextual por bloco',
+     fontsize=14)
+                ax2.set_xlabel('Bloco', fontsize=12)
+                ax2.set_ylabel(
+    'Diferença no tempo de resposta (s)',
+     fontsize=12)
+                ax2.set_xticks(range(1, NUM_BLOCKS + 1))
+                ax2.axhline(y=0, color='gray', linestyle='--', alpha=0.7)
+
+                # Salvar figura
+                plt.tight_layout()
+                plt.savefig(
+    os.path.join(
+        results_dir,
+        f"{filename}_analysis.png"),
+         dpi=100)
+
+                # Adicionar heatmap das posições do alvo e tempos de reação
+                if config.get('ENABLE_HEATMAP', False):
+                    plt.figure(figsize=(8, 8))
+
+                    # Extrair posições dos alvos e tempos de resposta
+                    target_positions = []
+                    for trial in correct_trials.itertuples():
+                        target_positions.append((
+                            trial.target_x,
+                            trial.target_y,
+                            trial.response_time
+                        ))
+
+                    # Criar matriz de tempos médios por posição
+                    heatmap_data = np.zeros((GRID_SIZE, GRID_SIZE))
+                    position_counts = np.zeros((GRID_SIZE, GRID_SIZE))
+
+                    for x, y, rt in target_positions:
+                        heatmap_data[y, x] += rt
+                        position_counts[y, x] += 1
+
+                    # Calcular médias (evitando divisão por zero)
+                    mask = position_counts > 0
+                    heatmap_data[mask] = heatmap_data[mask] / \
+                        position_counts[mask]
+
+                    # Gerar heatmap
+                    sns.heatmap(heatmap_data, cmap="YlOrRd", annot=True, fmt=".2f",
+                               cbar_kws={'label': 'Tempo médio de resposta (s)'})
+                    plt.title('Heatmap: Tempo de reação por posição do alvo')
+                    plt.savefig(
+    os.path.join(
+        results_dir,
+        f"{filename}_heatmap.png"),
+         dpi=100)
+
+                # Taxa de acertos
+                accuracy = len(
+                    results_df[results_df['is_correct']]) / len(results_df) * 100
+                f.write(f"\nTaxa de acertos: {accuracy:.1f}%\n")
+
+                # Efeito de indicação contextual
+                mean_repeated = results_df[results_df['is_repeated']
+                    & results_df['is_correct']]['response_time'].mean()
+                mean_novel = results_df[~results_df['is_repeated']
+                    & results_df['is_correct']]['response_time'].mean()
+                contextual_effect = mean_novel - mean_repeated
+
+                f.write(
+    f"\nEfeito de indicação contextual: {
+        contextual_effect:.3f}s\n")
+                f.write(
+    f"(Tempo médio em configurações novas - Tempo médio em configurações repetidas)\n")
+
+                # Informações sobre configuração do experimento
+                f.write("\n\n===== CONFIGURAÇÃO DO EXPERIMENTO =====\n\n")
+                f.write(f"Número de blocos: {NUM_BLOCKS}\n")
+                f.write(f"Configurações repetidas: {NUM_REPEATED_CONFIGS}\n")
+                f.write(f"Configurações novas por bloco: {
+                        NUM_NOVEL_CONFIGS}\n")
+                f.write(f"Itens por configuração: {NUM_ITEMS}\n")
+                f.write(f"Tipo do alvo: {TARGET_TYPE}\n")
+                f.write(f"Tipo do distrator: {DISTRACTOR_TYPE}\n")
+                f.write(f"Tamanho da grade: {GRID_SIZE}x{GRID_SIZE}\n")
+
+        except Exception as e:
+            print(f"Erro na análise: {e}")
+
+        print(f"Resultados salvos em: {csv_path}")
+              def run(self):
+        """Método principal para executar o experimento"""
+        # Se argumento --edit-config foi passado, abrir editor de configuração
+        if args.edit_config:
+            config.edit_gui(screen)
+            self.reload_config()
+
+        # Aplicar configurações de acessibilidade
+        self.apply_accessibility_settings()
+
+        # Verificar se deve iniciar no modo demo
+        if config.get('START_IN_DEMO_MODE', False):
+            self.start_demo_mode()
+        else:
+            self.get_participant_info()
+            self.setup_experiment()
+
+        clock = pygame.time.Clock()
+
+        # Loop principal
+        running = True
+        while running:
+            # Tratar eventos comuns a todos os estados
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        # Confirmar saída se estiver no meio do experimento
+                        if self.state not in ["welcome", "end"]:
+                            self.confirm_exit()
+                        else:
+                            running = False
+                    # Tecla F12 para capturar screenshot
+                    elif event.key == pygame.K_F12:
+                        self.capture_screenshot()
+
+            # Processar estado atual
+            if self.state == "welcome":
+                self.show_welcome()
+            elif self.state == "demographics":
+                self.collect_demographic_data()
+            elif self.state == "fixation":
+                self.show_fixation()
+            elif self.state == "trial":
+                self.run_trial()
+            elif self.state == "feedback":
+                self.show_feedback()
+            elif self.state == "break":
+                self.show_break()
+            elif self.state == "end":
+                self.show_end()
+                running = False
+            elif self.state == "demo":
+                self.show_demo_step()
+            elif self.state == "exit_confirm":
+                self.process_exit_confirmation()
+
+            clock.tick(FPS)
+
+    def confirm_exit(self):
+        """Confirma se o usuário deseja realmente sair no meio do experimento"""
+        self.previous_state = self.state
+        self.state = "exit_confirm"
+
+    def process_exit_confirmation(self):
+        """Processa a confirmação de saída"""
+        screen.fill(WHITE)
+
+        # Texto de confirmação
+        text = font.render(
+    "Deseja realmente sair do experimento?", True, BLACK)
+        text2 = font.render(
+    "Os dados coletados até agora serão salvos.", True, BLACK)
+        text3 = small_font.render(
+    "Pressione ESC novamente para sair ou ESPAÇO para continuar", True, BLUE)
+
+        screen.blit(
+    text,
+    (WIDTH //
+    2 -
+    text.get_width() //
+    2,
+    HEIGHT //
+    2 -
+     50))
+        screen.blit(text2, (WIDTH // 2 - text2.get_width() // 2, HEIGHT // 2))
+        screen.blit(
+    text3,
+    (WIDTH //
+    2 -
+    text3.get_width() //
+    2,
+    HEIGHT //
+    2 +
+     50))
+
+        pygame.display.flip()
+
+        # Aguardar resposta
+        waiting = True
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    self.save_results()
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_ESCAPE:
+                        # Salvar resultados parciais e sair
+                        self.save_results()
+                        pygame.quit()
+                        sys.exit()
+                    elif event.key == pygame.K_SPACE:
+                        # Voltar ao estado anterior
+                        self.state = self.previous_state
+                        waiting = False
+
+    def capture_screenshot(self):
+        """Captura um screenshot da tela atual"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        screenshots_dir = os.path.join(
+    os.path.dirname(
+        os.path.abspath(__file__)), config.get(
+            'SCREENSHOTS_DIR', "screenshots"))
+        os.makedirs(screenshots_dir, exist_ok=True)
+
+        filename = os.path.join(screenshots_dir, f"screenshot_{timestamp}.png")
+        pygame.image.save(screen, filename)
+
+    def start_demo_mode(self):
+        """Inicia modo de demonstração para avaliadores"""
+        # Configurar modo de demonstração
+        self.state = "demo"
+        self.demo_step = 0
+        self.demo_steps = [
+            "welcome",       # Tela de boas-vindas
+            "config_edit",   # Edição de configurações
+            "stimulus_preview",  # Visualização dos estímulos
+            "trial_demo",    # Demonstração de trial
+            "results_demo",  # Demonstração de resultados
+            "end"            # Fim da demonstração
+        ]
+        self.demo_messages = [
+            "Bem-vindo ao modo de demonstração da CCT!\nPressione ESPAÇO para continuar.",
+            "Aqui é possível editar todas as configurações.\nPressione ESPAÇO para continuar.",
+            "Visualização de todos os estímulos disponíveis.\nPressione ESPAÇO para continuar.",
+            "Demonstração de um trial experimental.\nPressione ESPAÇO para continuar.",
+            "Visualização dos resultados e análises.\nPressione ESPAÇO para continuar.",
+            "Fim da demonstração.\nPressione ESC para sair ou ESPAÇO para reiniciar."
+        ]
+        self.demo_duration = 0
+
+    def show_demo_step(self):
+        """Mostra uma etapa do modo de demonstração"""
+        step = self.demo_steps[self.demo_step]
+        message = self.demo_messages[self.demo_step]
+
+        screen.fill(WHITE)
+
+        # Título
+        title = font.render(
+            f"MODO DE DEMONSTRAÇÃO - Passo {self.demo_step + 1}/{len(self.demo_steps)}", True, BLUE)
+        screen.blit(title, (WIDTH // 2 - title.get_width() // 2, 30))
+
+        # Mensagem
+        lines = message.split('\n')
+        for i, line in enumerate(lines):
+            text = small_font.render(line, True, BLACK)
+            screen.blit(
+    text, (WIDTH // 2 - text.get_width() // 2, 80 + i * 25))
+
+        # Conteúdo específico de cada etapa
+        if step == "welcome":
+            self.show_demo_welcome()
+        elif step == "config_edit":
+            self.show_demo_config()
+        elif step == "stimulus_preview":
+            self.show_demo_stimuli()
+        elif step == "trial_demo":
+            self.show_demo_trial()
+        elif step == "results_demo":
+            self.show_demo_results()
+        elif step == "end":
+            self.show_demo_end()
+
+        pygame.display.flip()
+
+        # Esperar input do usuário
+        waiting = True
+        while waiting:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    pygame.quit()
+                    sys.exit()
+                elif event.type == pygame.KEYDOWN:
+                    if event.key == pygame.K_SPACE:
+                        self.demo_step = (
+                            self.demo_step + 1) % len(self.demo_steps)
+                        waiting = False
+                    elif event.key == pygame.K_ESCAPE:
+                        self.state = "welcome"
+                        waiting = False
+      def show_demo_welcome(self):
+        """Mostra a tela de boas-vindas do demo com explicação detalhada"""
+        # Desenhar área principal
+        main_area = pygame.Rect(WIDTH//10, HEIGHT//4, WIDTH*8//10, HEIGHT//2)
+        pygame.draw.rect(screen, (240, 240, 240) if BACKGROUND_COLOR == WHITE else (50, 50, 50), main_area)
+        pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, main_area, 2)
+        
+        # Título principal
+        title = font.render("Tarefa de Indicação Contextual (CCT)", True, BLUE)
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, main_area.top + 20))
+        
+        # Descrição
+        description = [
+            "Nesta tarefa, participantes procuram um alvo entre distratores.",
+            "Algumas configurações de estímulos são repetidas ao longo do experimento,",
+            "enquanto outras são totalmente novas.",
+            "",
+            "O objetivo é medir o aprendizado implícito das configurações repetidas,",
+            "o que deve resultar em tempos de reação mais rápidos nessas configurações."
+        ]
+        
+        y_offset = main_area.top + 70
+        for line in description:
+            text = small_font.render(line, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(text, (WIDTH//2 - text.get_width()//2, y_offset))
+            y_offset += 25
+        
+        # Exemplo visual simplificado
+        example_area = pygame.Rect(WIDTH//4, y_offset + 20, WIDTH//2, HEIGHT//6)
+        pygame.draw.rect(screen, WHITE, example_area)
+        pygame.draw.rect(screen, BLACK, example_area, 1)
+        
+        # Desenhar um exemplo simples de alvo e distratores
+        target_pos = (example_area.left + example_area.width//4, example_area.top + example_area.height//2)
+        # Desenhar um T
+        pygame.draw.line(screen, RED, (target_pos[0] - 10, target_pos[1]), (target_pos[0] + 10, target_pos[1]), 3)
+        pygame.draw.line(screen, RED, (target_pos[0], target_pos[1] - 10), (target_pos[0], target_pos[1] + 10), 3)
+        pygame.draw.circle(screen, RED, target_pos, 15, 1)  # Círculo ao redor do alvo
+        
+        # Desenhar alguns Ls como distratores
+        distr_pos1 = (example_area.left + example_area.width//2, example_area.top + example_area.height//3)
+        pygame.draw.line(screen, BLACK, (distr_pos1[0] - 10, distr_pos1[1]), (distr_pos1[0], distr_pos1[1]), 3)
+        pygame.draw.line(screen, BLACK, (distr_pos1[0] - 10, distr_pos1[1]), (distr_pos1[0] - 10, distr_pos1[1] + 10), 3)
+        
+        distr_pos2 = (example_area.left + 3*example_area.width//4, example_area.top + 2*example_area.height//3)
+        pygame.draw.line(screen, BLACK, (distr_pos2[0], distr_pos2[1] - 10), (distr_pos2[0], distr_pos2[1]), 3)
+        pygame.draw.line(screen, BLACK, (distr_pos2[0], distr_pos2[1]), (distr_pos2[0] + 10, distr_pos2[1]), 3)
+        
+        # Legenda
+        target_text = small_font.render("Alvo (T)", True, RED)
+        screen.blit(target_text, (target_pos[0] - target_text.get_width()//2, target_pos[1] + 20))
+        
+        distr_text = small_font.render("Distratores (L)", True, BLACK)
+        screen.blit(distr_text, (distr_pos2[0] - distr_text.get_width()//2, distr_pos2[1] + 20))
+    
+    def show_demo_config(self):
+        """Mostra a tela de configuração do demo com categorias"""
+        # Área principal
+        main_area = pygame.Rect(WIDTH//10, HEIGHT//10, WIDTH*8//10, HEIGHT*8//10)
+        pygame.draw.rect(screen, (240, 240, 240) if BACKGROUND_COLOR == WHITE else (50, 50, 50), main_area)
+        pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, main_area, 2)
+        
+        # Título
+        title = font.render("Configurações Personalizáveis", True, BLUE)
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, main_area.top + 15))
+        
+        # Categorias de configurações
+        categories = [
+            {
+                "name": "Estímulos",
+                "configs": [
+                    "TARGET_TYPE = 'T' ou 'H', 'V', 'S', etc.",
+                    "DISTRACTOR_TYPE = 'L' ou outros",
+                    "TARGET_COLOR = BLACK ou qualquer cor RGB",
+                    "STIM_SIZE = 30 (tamanho em pixels)",
+                    "TARGET_LINE_WIDTH = 2 (espessura da linha)"
+                ]
+            },
+            {
+                "name": "Experimental",
+                "configs": [
+                    "NUM_BLOCKS = 5 (número de blocos)",
+                    "NUM_REPEATED_CONFIGS = 12 (configurações repetidas)",
+                    "NUM_NOVEL_CONFIGS = 12 (configurações novas por bloco)",
+                    "BALANCED_QUADRANTS = True (balancear posições)",
+                    "TARGET_MARGIN = 1 (margem da borda da tela)"
+                ]
+            },
+            {
+                "name": "Acessibilidade",
+                "configs": [
+                    "COLORBLIND_MODE = False (modo daltônico)",
+                    "LARGE_STIMULI_MODE = False (estímulos grandes)",
+                    "LARGE_TEXT_MODE = False (texto ampliado)",
+                    "HIGH_CONTRAST_MODE = False (alto contraste)"
+                ]
+            }
+        ]
+        
+        # Desenhar categorias
+        y_offset = main_area.top + 60
+        col_width = main_area.width // len(categories)
+        
+        for i, category in enumerate(categories):
+            # Cabeçalho da categoria
+            cat_title = font.render(category["name"], True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            cat_x = main_area.left + i * col_width + col_width//2 - cat_title.get_width()//2
+            screen.blit(cat_title, (cat_x, y_offset))
+            
+            # Desenhar linha separadora
+            pygame.draw.line(screen, BLUE, 
+                            (cat_x - 10, y_offset + cat_title.get_height() + 5),
+                            (cat_x + cat_title.get_width() + 10, y_offset + cat_title.get_height() + 5), 2)
+            
+            # Configurações
+            config_y = y_offset + cat_title.get_height() + 20
+            for cfg in category["configs"]:
+                cfg_text = small_font.render(cfg, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                screen.blit(cfg_text, (main_area.left + 20 + i * col_width, config_y))
+                config_y += 30
+        
+        # Nota sobre editor de configuração
+        note_y = main_area.bottom - 60
+        note = small_font.render("No experimento real, todas estas configurações podem ser", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+        note2 = small_font.render("editadas através de uma interface gráfica ou do arquivo config.py.", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+        
+        screen.blit(note, (WIDTH//2 - note.get_width()//2, note_y))
+        screen.blit(note2, (WIDTH//2 - note2.get_width()//2, note_y + 25))
+      def show_demo_stimuli(self):
+        """Mostra todos os estímulos disponíveis com opções de customização"""
+        # Área principal
+        main_area = pygame.Rect(WIDTH//10, HEIGHT//8, WIDTH*8//10, HEIGHT*6//8)
+        pygame.draw.rect(screen, (245, 245, 245) if BACKGROUND_COLOR == WHITE else (40, 40, 40), main_area)
+        pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, main_area, 2)
+        
+        # Título
+        title = font.render("Biblioteca de Estímulos Disponíveis", True, BLUE)
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, main_area.top + 15))
+        
+        # Explicação
+        subtitle = small_font.render("Esta implementação inclui vários tipos de estímulos com customizações", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+        screen.blit(subtitle, (WIDTH//2 - subtitle.get_width()//2, main_area.top + 45))
+        
+        # Criar superfícies para cada tipo de estímulo
+        stim_types = ['T', 'L', 'X', '+', 'Y', 'F', 'E', 'H', 'V', 'S', 'C', 'Z']
+        stim_size = 40
+        
+        # Parâmetros para os estímulos
+        effects_options = [
+            None,
+            {'glow': True, 'glow_color': (255, 0, 0)},
+            {'shadow': True},
+            {'border_color': BLUE}
+        ]
+        
+        effect_names = ["Padrão", "Brilho", "Sombra", "Borda"]
+        colors = [BLACK, RED, GREEN, BLUE]
+        line_widths = [1, 2, 3, 0]  # 0 = preenchido
+        
+        # Calcular layout
+        stim_margin = 60
+        stim_per_row = 6
+        stim_rows = len(stim_types) // stim_per_row + (1 if len(stim_types) % stim_per_row > 0 else 0)
+        
+        # Desenhar estímulos em grade
+        for i, stim_type in enumerate(stim_types):
+            row = i // stim_per_row
+            col = i % stim_per_row
+            
+            x = main_area.left + col * stim_margin * 2 + stim_margin
+            y = main_area.top + 80 + row * stim_margin * 2
+            
+            # Criar superfície
+            surf = pygame.Surface((stim_size, stim_size), pygame.SRCALPHA)
+            
+            # Renderizar estímulo com cor e espessura padrão
+            StimulusRenderer.render_stimulus(stim_type, surf, BLACK, stim_size)
+            
+            # Desenhar na tela
+            screen.blit(surf, (x - stim_size//2, y - stim_size//2))
+            
+            # Adicionar nome do estímulo
+            label = small_font.render(stim_type, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(label, (x - label.get_width()//2, y + stim_size//2 + 5))
+        
+        # Demonstração de customizações
+        effects_area = pygame.Rect(main_area.left + 20, main_area.top + 200, main_area.width - 40, 180)
+        pygame.draw.rect(screen, (235, 235, 235) if BACKGROUND_COLOR == WHITE else (50, 50, 50), effects_area)
+        pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, effects_area, 1)
+        
+        effects_title = small_font.render("Customizações Disponíveis:", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+        screen.blit(effects_title, (effects_area.left + 10, effects_area.top + 10))
+        
+        # Demonstrações de efeitos
+        effect_x_start = effects_area.left + 30
+        effect_y = effects_area.top + 50
+        effect_margin = 120
+        
+        for i, effect in enumerate(effects_options):
+            # Criar superfície
+            surf = pygame.Surface((stim_size, stim_size), pygame.SRCALPHA)
+            
+            # Renderizar com efeito
+            StimulusRenderer.render_stimulus('T', surf, colors[i % len(colors)], stim_size, 
+                                           line_width=line_widths[i % len(line_widths)], effects=effect)
+            
+            # Desenhar na tela
+            effect_x = effect_x_start + i * effect_margin
+            screen.blit(surf, (effect_x - stim_size//2, effect_y - stim_size//2))
+            
+            # Label do efeito
+            effect_label = small_font.render(effect_names[i], True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(effect_label, (effect_x - effect_label.get_width()//2, effect_y + stim_size//2 + 5))
+            
+            # Label da cor
+            color_name = ["Preto", "Vermelho", "Verde", "Azul"][i % len(colors)]
+            color_label = small_font.render(color_name, True, colors[i % len(colors)])
+            screen.blit(color_label, (effect_x - color_label.get_width()//2, effect_y + stim_size//2 + 25))
+        
+        # Nota sobre implementação
+        note_y = main_area.bottom - 40
+        note = small_font.render("A implementação permite combinar diferentes tipos, cores, linhas e efeitos.", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+        screen.blit(note, (WIDTH//2 - note.get_width()//2, note_y))
+    
+    def show_demo_trial(self):
+        """Mostra uma demonstração interativa de trial com etapas"""
+        # Inicializar a animação se primeira chamada
+        if not hasattr(self, 'demo_animation_step'):
+            self.demo_animation_step = 0
+            self.demo_animation_timer = 0
+            self.demo_target_found = False
+            
+        # Incrementar timer de animação
+        self.demo_animation_timer += 1/FPS
+        
+        # Área principal - grade de estímulos
+        grid_area = pygame.Rect(GRID_START_X, GRID_START_Y, 
+                              GRID_SIZE * CELL_SIZE, GRID_SIZE * CELL_SIZE)
+        
+        # Informações sobre animação atual
+        animation_stages = [
+            "Aguardando início do trial",
+            "Fixação",
+            "Procura Visual",
+            "Alvo Encontrado",
+            "Feedback"
+        ]
+        
+        # Atualizar animação baseado na etapa
+        if self.demo_animation_timer > 2.0 and self.demo_animation_step < len(animation_stages) - 1:
+            self.demo_animation_step += 1
+            self.demo_animation_timer = 0
+        
+        # Desenhar interface com base na etapa atual
+        current_stage = animation_stages[self.demo_animation_step]
+        
+        # Área para título e informações
+        info_area = pygame.Rect(WIDTH//10, HEIGHT//12, WIDTH*8//10, HEIGHT//6)
+        pygame.draw.rect(screen, (240, 240, 240) if BACKGROUND_COLOR == WHITE else (50, 50, 50), info_area)
+        pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, info_area, 2)
+        
+        # Título da etapa atual
+        stage_title = font.render(f"Etapa: {current_stage}", True, BLUE)
+        screen.blit(stage_title, (WIDTH//2 - stage_title.get_width()//2, info_area.top + 15))
+        
+        # Desenhar a interface principal baseada na etapa
+        if current_stage == "Aguardando início do trial":
+            # Texto de instrução
+            instr = small_font.render("O experimento começa com instruções e fixação", True, 
+                                    BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            instr2 = small_font.render("O participante deve manter os olhos no centro da tela", True,
+                                     BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            
+            screen.blit(instr, (WIDTH//2 - instr.get_width()//2, info_area.top + 50))
+            screen.blit(instr2, (WIDTH//2 - instr2.get_width()//2, info_area.top + 75))
+            
+            # Mostrar área da grade vazia
+            pygame.draw.rect(screen, (250, 250, 250), grid_area)
+            pygame.draw.rect(screen, GRID_COLOR, grid_area, 2)
+        
+        elif current_stage == "Fixação":
+            # Texto de instrução
+            instr = small_font.render("Uma cruz de fixação aparece para centralizar a atenção", True, 
+                                    BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(instr, (WIDTH//2 - instr.get_width()//2, info_area.top + 50))
+            
+            # Mostrar área da grade com cruz de fixação
+            pygame.draw.rect(screen, (250, 250, 250), grid_area)
+            pygame.draw.rect(screen, GRID_COLOR, grid_area, 2)
+            
+            # Desenhar cruz de fixação
+            pygame.draw.line(screen, BLACK, 
+                            (grid_area.centerx - 15, grid_area.centery), 
+                            (grid_area.centerx + 15, grid_area.centery), 3)
+            pygame.draw.line(screen, BLACK,
+                            (grid_area.centerx, grid_area.centery - 15),
+                            (grid_area.centerx, grid_area.centery + 15), 3)
+            
+        elif current_stage == "Procura Visual":
+            # Texto de instrução
+            instr = small_font.render("O participante deve encontrar a letra T entre os distratores", True, 
+                                    BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(instr, (WIDTH//2 - instr.get_width()//2, info_area.top + 50))
+            
+            # Mostrar grade com linhas
+            pygame.draw.rect(screen, (250, 250, 250), grid_area)
+            
+            # Desenhar linhas de grade
+            for i in range(GRID_SIZE + 1):
+                # Linhas horizontais
+                pygame.draw.line(screen, 
+                                GRID_COLOR, 
+                                (GRID_START_X, GRID_START_Y + i * CELL_SIZE), 
+                                (GRID_START_X + GRID_SIZE * CELL_SIZE, GRID_START_Y + i * CELL_SIZE))
+                
+                # Linhas verticais
+                pygame.draw.line(screen, 
+                                GRID_COLOR, 
+                                (GRID_START_X + i * CELL_SIZE, GRID_START_Y), 
+                                (GRID_START_X + i * CELL_SIZE, GRID_START_Y + GRID_SIZE * CELL_SIZE))
+            
+            # Criar alguns estímulos de demonstração
+            demo_target = Stimulus('T', (2, 3), 180, is_target=True)
+            demo_target.draw()
+            
+            distractors = []
+            for i in range(11):
+                x = (i % 5) + 1
+                y = (i // 5) + 1
+                if (x, y) != (2, 3):  # Não sobrepor o alvo
+                    distractor = Stimulus('L', (x, y), 90 * (i % 4))
+                    distractor.draw()
+                    distractors.append(distractor)
+                    
+            # Animação de procura - simular movimento de olhos
+            if self.demo_animation_timer < 1.5:
+                # Círculo que representa o foco de atenção
+                focus_x = int(GRID_START_X + CELL_SIZE * (1 + self.demo_animation_timer * 3))
+                focus_y = int(GRID_START_Y + CELL_SIZE * (1 + self.demo_animation_timer * 1.5))
+                pygame.draw.circle(screen, (200, 200, 255, 128), (focus_x, focus_y), 40, 2)
+        
+        elif current_stage == "Alvo Encontrado":
+            # Texto de instrução
+            instr = small_font.render("Quando encontrar o alvo, o participante clica nele", True, 
+                                    BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(instr, (WIDTH//2 - instr.get_width()//2, info_area.top + 50))
+            
+            # Mostrar grade com linhas
+            pygame.draw.rect(screen, (250, 250, 250), grid_area)
+            
+            # Desenhar linhas de grade
+            for i in range(GRID_SIZE + 1):
+                pygame.draw.line(screen, 
+                                GRID_COLOR, 
+                                (GRID_START_X, GRID_START_Y + i * CELL_SIZE), 
+                                (GRID_START_X + GRID_SIZE * CELL_SIZE, GRID_START_Y + i * CELL_SIZE))
+                
+                pygame.draw.line(screen, 
+                                GRID_COLOR, 
+                                (GRID_START_X + i * CELL_SIZE, GRID_START_Y), 
+                                (GRID_START_X + i * CELL_SIZE, GRID_START_Y + GRID_SIZE * CELL_SIZE))
+            
+            # Criar alguns estímulos de demonstração
+            demo_target = Stimulus('T', (2, 3), 180, is_target=True)
+            demo_target.draw()
+            
+            distractors = []
+            for i in range(11):
+                x = (i % 5) + 1
+                y = (i // 5) + 1
+                if (x, y) != (2, 3):  # Não sobrepor o alvo
+                    distractor = Stimulus('L', (x, y), 90 * (i % 4))
+                    distractor.draw()
+                    distractors.append(distractor)
+            
+            # Destacar alvo encontrado
+            target_pos = (GRID_START_X + 2 * CELL_SIZE + CELL_SIZE // 2,
+                         GRID_START_Y + 3 * CELL_SIZE + CELL_SIZE // 2)
+            
+            # Círculo destacando o alvo
+            pygame.draw.circle(screen, GREEN, target_pos, 30, 3)
+            
+            # Desenhar cursor do mouse próximo ao alvo
+            cursor_pos = (target_pos[0] + 5 - 10 * (1 - self.demo_animation_timer),
+                         target_pos[1] + 5 - 10 * (1 - self.demo_animation_timer))
+            
+            # Desenhar seta indicativa
+            arrow_start = (GRID_START_X + 2 * CELL_SIZE + CELL_SIZE//2, 
+                          GRID_START_Y - 30)
+            arrow_end = (GRID_START_X + 2 * CELL_SIZE + CELL_SIZE//2, 
+                        GRID_START_Y + 3 * CELL_SIZE)
+            pygame.draw.line(screen, RED, arrow_start, arrow_end, 2)
+            pygame.draw.polygon(screen, RED, [
+                (arrow_end[0], arrow_end[1]),
+                (arrow_end[0] - 10, arrow_end[1] - 15),
+                (arrow_end[0] + 10, arrow_end[1] - 15),
+            ])
+            text = small_font.render("Alvo (T)", True, RED)
+            screen.blit(text, (arrow_start[0] - text.get_width()//2, arrow_start[1] - 25))
+            
+            # Cursor do mouse
+            pygame.draw.line(screen, BLACK, 
+                            (cursor_pos[0], cursor_pos[1]), 
+                            (cursor_pos[0] + 10, cursor_pos[1] + 10), 2)
+            pygame.draw.line(screen, BLACK,
+                            (cursor_pos[0], cursor_pos[1] + 10),
+                            (cursor_pos[0] + 10, cursor_pos[1]), 2)
+            
+        elif current_stage == "Feedback":
+            # Texto de instrução
+            instr = small_font.render("Após a resposta, feedback é mostrado (opcional)", True, 
+                                    BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(instr, (WIDTH//2 - instr.get_width()//2, info_area.top + 50))
+            
+            # Mostrar área da grade com feedback
+            pygame.draw.rect(screen, (250, 250, 250), grid_area)
+            pygame.draw.rect(screen, GRID_COLOR, grid_area, 2)
+            
+            # Feedback de correto
+            feedback_text = font.render("Correto!", True, GREEN)
+            screen.blit(feedback_text, 
+                       (grid_area.centerx - feedback_text.get_width()//2,
+                        grid_area.centery - feedback_text.get_height()//2))
+                        
+            # Mostrar tempo de resposta
+            rt_text = small_font.render("Tempo de resposta: 0.843s", True, BLACK)
+            screen.blit(rt_text,
+                       (grid_area.centerx - rt_text.get_width()//2,
+                        grid_area.centery + 40))
+        
+        # Controles de demonstração
+        controls_area = pygame.Rect(WIDTH//6, HEIGHT*5//6, WIDTH*4//6, HEIGHT//12)
+        pygame.draw.rect(screen, (230, 230, 230) if BACKGROUND_COLOR == WHITE else (60, 60, 60), controls_area)
+        pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, controls_area, 1)
+        
+        # Texto de controle
+        ctrl_text = small_font.render("← Anterior   ESPAÇO: Avançar animação   Próximo →", True,
+                                   BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+        screen.blit(ctrl_text, (WIDTH//2 - ctrl_text.get_width()//2, controls_area.centery - ctrl_text.get_height()//2))
+        
+        # Processar eventos de controle (não precisamos implementar aqui, são manipulados na função principal)
+      def show_demo_results(self):
+        """Mostra exemplos interativos de resultados e visualizações"""
+        # Configurar tabs para diferentes visualizações
+        if not hasattr(self, 'demo_results_tab'):
+            self.demo_results_tab = 0
+            
+        tabs = ["Gráfico de Tempo", "Efeito de Aprendizado", "Heatmap", "Análises"]
+        
+        # Área principal
+        main_area = pygame.Rect(WIDTH//10, HEIGHT//8, WIDTH*8//10, HEIGHT*3//4)
+        pygame.draw.rect(screen, (245, 245, 245) if BACKGROUND_COLOR == WHITE else (40, 40, 40), main_area)
+        pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, main_area, 2)
+        
+        # Título principal
+        title = font.render("Análise de Resultados", True, BLUE)
+        screen.blit(title, (WIDTH//2 - title.get_width()//2, main_area.top + 15))
+        
+        # Desenhar tabs
+        tab_width = main_area.width // len(tabs)
+        tab_height = 30
+        tab_y = main_area.top + 50
+        
+        for i, tab in enumerate(tabs):
+            tab_rect = pygame.Rect(main_area.left + i * tab_width, tab_y, tab_width, tab_height)
+            tab_color = BLUE if i == self.demo_results_tab else ((220, 220, 220) if BACKGROUND_COLOR == WHITE else (70, 70, 70))
+            text_color = WHITE if i == self.demo_results_tab else (BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            
+            pygame.draw.rect(screen, tab_color, tab_rect)
+            pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, tab_rect, 1)
+            
+            tab_text = small_font.render(tab, True, text_color)
+            screen.blit(tab_text, (tab_rect.centerx - tab_text.get_width()//2, 
+                                  tab_rect.centery - tab_text.get_height()//2))
+        
+        # Área para a visualização
+        viz_rect = pygame.Rect(main_area.left + 20, tab_y + tab_height + 20, 
+                             main_area.width - 40, main_area.height - tab_height - 60)
+        pygame.draw.rect(screen, (240, 240, 240) if BACKGROUND_COLOR == WHITE else (50, 50, 50), viz_rect)
+        
+        # Desenhar conteúdo baseado na tab selecionada
+        if self.demo_results_tab == 0:  # Gráfico de Tempo
+            # Título
+            viz_title = small_font.render("Tempo médio de reação por bloco e tipo de configuração", True,
+                                        BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(viz_title, (viz_rect.centerx - viz_title.get_width()//2, viz_rect.top + 15))
+            
+            # Desenhar exemplo de gráfico
+            graph_rect = pygame.Rect(viz_rect.left + 50, viz_rect.top + 50, 
+                                    viz_rect.width - 100, viz_rect.height - 100)
+            
+            # Eixos
+            pygame.draw.line(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+                            (graph_rect.left, graph_rect.bottom),
+                            (graph_rect.right, graph_rect.bottom), 2)
+            pygame.draw.line(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+                            (graph_rect.left, graph_rect.top),
+                            (graph_rect.left, graph_rect.bottom), 2)
+            
+            # Rótulos dos eixos
+            x_label = small_font.render("Blocos", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(x_label, (graph_rect.centerx - x_label.get_width()//2, graph_rect.bottom + 15))
+            
+            y_label = small_font.render("Tempo (s)", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            # Girar texto do eixo Y
+            y_label = pygame.transform.rotate(y_label, 90)
+            screen.blit(y_label, (graph_rect.left - 35, graph_rect.centery - y_label.get_height()//2))
+            
+            # Marcas dos eixos
+            for i in range(5):  # 5 blocos
+                x = graph_rect.left + i * (graph_rect.width - 20) // 4
+                pygame.draw.line(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+                               (x, graph_rect.bottom), (x, graph_rect.bottom + 5), 1)
+                block_label = small_font.render(str(i + 1), True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                screen.blit(block_label, (x - block_label.get_width()//2, graph_rect.bottom + 7))
+            
+            for i in range(6):  # Marcas de tempo (0s a 2.5s)
+                y = graph_rect.bottom - i * (graph_rect.height) // 5
+                pygame.draw.line(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+                               (graph_rect.left - 5, y), (graph_rect.left, y), 1)
+                time_label = small_font.render(f"{i/2:.1f}", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                screen.blit(time_label, (graph_rect.left - 30, y - time_label.get_height()//2))
+            
+            # Linhas de exemplo com efeito de aprendizado
+            # Linha para configurações repetidas (azul) - melhora com o tempo
+            points_repeated = [
+                (graph_rect.left, graph_rect.bottom - 60),
+                (graph_rect.left + (graph_rect.width - 20) // 4, graph_rect.bottom - 80),
+                (graph_rect.left + 2 * (graph_rect.width - 20) // 4, graph_rect.bottom - 110),
+                (graph_rect.left + 3 * (graph_rect.width - 20) // 4, graph_rect.bottom - 140),
+                (graph_rect.left + 4 * (graph_rect.width - 20) // 4, graph_rect.bottom - 160)
+            ]
+            
+            # Linha para configurações novas (vermelho) - melhora menos
+            points_novel = [
+                (graph_rect.left, graph_rect.bottom - 55),
+                (graph_rect.left + (graph_rect.width - 20) // 4, graph_rect.bottom - 65),
+                (graph_rect.left + 2 * (graph_rect.width - 20) // 4, graph_rect.bottom - 75),
+                (graph_rect.left + 3 * (graph_rect.width - 20) // 4, graph_rect.bottom - 85),
+                (graph_rect.left + 4 * (graph_rect.width - 20) // 4, graph_rect.bottom - 95)
+            ]
+            
+            # Desenhar linhas
+            pygame.draw.lines(screen, BLUE, False, points_repeated, 2)
+            pygame.draw.lines(screen, RED, False, points_novel, 2)
+            
+            # Pontos nas linhas
+            for point in points_repeated:
+                pygame.draw.circle(screen, BLUE, point, 5)
+            
+            for point in points_novel:
+                pygame.draw.circle(screen, RED, point, 5)
+            
+            # Legenda
+            legend_rect = pygame.Rect(graph_rect.right - 140, graph_rect.top, 130, 70)
+            pygame.draw.rect(screen, (250, 250, 250) if BACKGROUND_COLOR == WHITE else (30, 30, 30), legend_rect)
+            pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, legend_rect, 1)
+            
+            # Itens da legenda
+            pygame.draw.line(screen, BLUE, (legend_rect.left + 10, legend_rect.top + 20), 
+                            (legend_rect.left + 40, legend_rect.top + 20), 2)
+            pygame.draw.circle(screen, BLUE, (legend_rect.left + 25, legend_rect.top + 20), 5)
+            text = small_font.render("Repetidas", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(text, (legend_rect.left + 50, legend_rect.top + 15))
+            
+            pygame.draw.line(screen, RED, (legend_rect.left + 10, legend_rect.top + 50), 
+                            (legend_rect.left + 40, legend_rect.top + 50), 2)
+            pygame.draw.circle(screen, RED, (legend_rect.left + 25, legend_rect.top + 50), 5)
+            text = small_font.render("Novas", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(text, (legend_rect.left + 50, legend_rect.top + 45))
+            
+            # Interpretação
+            interp_rect = pygame.Rect(viz_rect.left + 20, viz_rect.bottom - 60, viz_rect.width - 40, 40)
+            pygame.draw.rect(screen, (235, 235, 255) if BACKGROUND_COLOR == WHITE else (40, 40, 60), interp_rect)
+            
+            interp_text = small_font.render("Interpretação: Aprendizado implícito mostrado pela diferença crescente entre as curvas.", True, 
+                                         BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(interp_text, (interp_rect.centerx - interp_text.get_width()//2, 
+                                    interp_rect.centery - interp_text.get_height()//2))
+            
+        elif self.demo_results_tab == 1:  # Efeito de Aprendizado
+            # Título
+            viz_title = small_font.render("Efeito de Indicação Contextual ao Longo dos Blocos", True,
+                                        BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(viz_title, (viz_rect.centerx - viz_title.get_width()//2, viz_rect.top + 15))
+            
+            # Desenhar exemplo de gráfico
+            graph_rect = pygame.Rect(viz_rect.left + 50, viz_rect.top + 50, 
+                                    viz_rect.width - 100, viz_rect.height - 100)
+            
+            # Eixos
+            pygame.draw.line(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+                            (graph_rect.left, graph_rect.bottom),
+                            (graph_rect.right, graph_rect.bottom), 2)
+            pygame.draw.line(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+                            (graph_rect.left, graph_rect.top),
+                            (graph_rect.left, graph_rect.bottom), 2)
+            
+            # Linha de referência (zero)
+            pygame.draw.line(screen, (150, 150, 150),
+                            (graph_rect.left, graph_rect.centery),
+                            (graph_rect.right, graph_rect.centery), 1)
+            
+            # Rótulos dos eixos
+            x_label = small_font.render("Blocos", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(x_label, (graph_rect.centerx - x_label.get_width()//2, graph_rect.bottom + 15))
+            
+            y_label = small_font.render("Efeito (s)", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            # Girar texto do eixo Y
+            y_label = pygame.transform.rotate(y_label, 90)
+            screen.blit(y_label, (graph_rect.left - 35, graph_rect.centery - y_label.get_height()//2))
+            
+            # Marcas dos eixos
+            for i in range(5):  # 5 blocos
+                x = graph_rect.left + i * (graph_rect.width - 20) // 4
+                pygame.draw.line(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+                               (x, graph_rect.bottom), (x, graph_rect.bottom + 5), 1)
+                block_label = small_font.render(str(i + 1), True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                screen.blit(block_label, (x - block_label.get_width()//2, graph_rect.bottom + 7))
+            
+            # Marcas de efeito
+            for i in range(-2, 3):  # -0.2s a 0.2s
+                y = graph_rect.centery - i * (graph_rect.height // 5)
+                pygame.draw.line(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE,
+                               (graph_rect.left - 5, y), (graph_rect.left, y), 1)
+                effect_label = small_font.render(f"{i/10:.1f}", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                screen.blit(effect_label, (graph_rect.left - 30, y - effect_label.get_height()//2))
+            
+            # Barras de efeito
+            effects = [0.01, 0.05, 0.10, 0.15, 0.18]  # Em segundos
+            bar_width = (graph_rect.width - 20) // 10
+            
+            for i, effect in enumerate(effects):
+                x = graph_rect.left + i * (graph_rect.width - 20) // 4
+                bar_height = effect * graph_rect.height // 0.4  # Escala para o gráfico
+                
+                bar_rect = pygame.Rect(x - bar_width//2, graph_rect.centery - bar_height, 
+                                     bar_width, bar_height)
+                
+                pygame.draw.rect(screen, PURPLE, bar_rect)
+                pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, bar_rect, 1)
+                
+                # Valor acima da barra
+                value_text = small_font.render(f"{effect:.2f}s", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                screen.blit(value_text, (x - value_text.get_width()//2, 
+                                       bar_rect.top - value_text.get_height() - 5))
+            
+            # Interpretação
+            interp_rect = pygame.Rect(viz_rect.left + 20, viz_rect.bottom - 60, viz_rect.width - 40, 40)
+            pygame.draw.rect(screen, (235, 235, 255) if BACKGROUND_COLOR == WHITE else (40, 40, 60), interp_rect)
+            
+            interp_text = small_font.render("Interpretação: Efeito de indicação contextual aumenta ao longo dos blocos.", True, 
+                                         BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(interp_text, (interp_rect.centerx - interp_text.get_width()//2, 
+                                    interp_rect.centery - interp_text.get_height()//2))
+                                    
+        elif self.demo_results_tab == 2:  # Heatmap
+            # Título
+            viz_title = small_font.render("Heatmap: Tempo de Reação por Posição do Alvo", True,
+                                        BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(viz_title, (viz_rect.centerx - viz_title.get_width()//2, viz_rect.top + 15))
+            
+            # Área do heatmap
+            heat_size = min(viz_rect.height - 100, viz_rect.width - 100)
+            heat_rect = pygame.Rect(
+                viz_rect.centerx - heat_size//2, 
+                viz_rect.top + 50, 
+                heat_size, heat_size
+            )
+            
+            # Gerar dados de exemplo para o heatmap
+            # Tempos mais rápidos na parte superior esquerda (típico em leitura ocidental)
+            heat_data = [
+                [1.2, 1.3, 1.5, 1.7, 1.9, 2.1],
+                [1.3, 1.4, 1.6, 1.8, 2.0, 2.2],
+                [1.4, 1.5, 1.7, 1.9, 2.1, 2.2],
+                [1.6, 1.7, 1.8, 2.0, 2.1, 2.3],
+                [1.7, 1.8, 1.9, 2.1, 2.2, 2.3],
+                [1.8, 1.9, 2.0, 2.2, 2.3, 2.4]
+            ]
+            
+            # Calcular cores baseadas no valor (vermelho para lento, verde para rápido)
+            cell_size = heat_size // 6
+            min_val = min([min(row) for row in heat_data])
+            max_val = max([max(row) for row in heat_data])
+            value_range = max_val - min_val
+            
+            # Desenhar células do heatmap
+            for y in range(6):
+                for x in range(6):
+                    value = heat_data[y][x]
+                    # Normalizar para 0-1
+                    norm_value = (value - min_val) / value_range if value_range > 0 else 0.5
+                    
+                    # Cores: verde (rápido) para vermelho (lento)
+                    r = int(255 * norm_value)
+                    g = int(255 * (1 - norm_value))
+                    b = 0
+                    
+                    cell_rect = pygame.Rect(
+                        heat_rect.left + x * cell_size,
+                        heat_rect.top + y * cell_size,
+                        cell_size, cell_size
+                    )
+                    
+                    pygame.draw.rect(screen, (r, g, b), cell_rect)
+                    pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, cell_rect, 1)
+                    
+                    # Mostrar valor
+                    text_color = BLACK if norm_value < 0.5 else WHITE
+                    value_text = small_font.render(f"{value:.1f}", True, text_color)
+                    screen.blit(value_text, (cell_rect.centerx - value_text.get_width()//2,
+                                           cell_rect.centery - value_text.get_height()//2))
+            
+            # Barra de cor
+            colorbar_rect = pygame.Rect(heat_rect.right + 30, heat_rect.top, 30, heat_rect.height)
+            gradient_stops = 20
+            
+            for i in range(gradient_stops):
+                norm_value = i / (gradient_stops - 1)
+                r = int(255 * norm_value)
+                g = int(255 * (1 - norm_value))
+                b = 0
+                
+                stop_rect = pygame.Rect(
+                    colorbar_rect.left,
+                    colorbar_rect.top + i * (colorbar_rect.height // gradient_stops),
+                    colorbar_rect.width,
+                    colorbar_rect.height // gradient_stops + 1  # +1 para evitar gaps
+                )
+                
+                pygame.draw.rect(screen, (r, g, b), stop_rect)
+            
+            # Rótulos da barra
+            min_label = small_font.render(f"{min_val:.1f}s", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            max_label = small_font.render(f"{max_val:.1f}s", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            
+            screen.blit(min_label, (colorbar_rect.right + 5, colorbar_rect.bottom - min_label.get_height()))
+            screen.blit(max_label, (colorbar_rect.right + 5, colorbar_rect.top))
+            
+            title_label = small_font.render("Tempo (s)", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            # Girar
+            title_label = pygame.transform.rotate(title_label, 270)
+            screen.blit(title_label, (colorbar_rect.left - 20, 
+                                     colorbar_rect.centery - title_label.get_height()//2))
+            
+            # Interpretação
+            interp_rect = pygame.Rect(viz_rect.left + 20, viz_rect.bottom - 60, viz_rect.width - 40, 40)
+            pygame.draw.rect(screen, (235, 235, 255) if BACKGROUND_COLOR == WHITE else (40, 40, 60), interp_rect)
+            
+            interp_text = small_font.render("Interpretação: Alvos na parte superior esquerda são detectados mais rapidamente.", True, 
+                                         BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(interp_text, (interp_rect.centerx - interp_text.get_width()//2, 
+                                    interp_rect.centery - interp_text.get_height()//2))
+            
+        elif self.demo_results_tab == 3:  # Análises
+            # Título
+            viz_title = small_font.render("Análises Estatísticas", True,
+                                        BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(viz_title, (viz_rect.centerx - viz_title.get_width()//2, viz_rect.top + 15))
+            
+            # Resultados estatísticos de exemplo
+            stats_text = [
+                "Resumo da Análise Estatística:",
+                "",
+                "• Tempo médio em configurações repetidas: 1.54s",
+                "• Tempo médio em configurações novas: 1.72s",
+                "• Efeito de indicação contextual: 0.18s (10.5%)",
+                "",
+                "• Teste-t pareado: t(23) = 3.42, p = 0.002",
+                "• Conclusão: Efeito estatisticamente significativo (p < 0.05)",
+                "",
+                "• ANOVA de medidas repetidas para efeito x bloco:",
+                "  F(4, 92) = 3.78, p = 0.007",
+                "• Conclusão: O efeito aumenta significativamente com o tempo",
+                "",
+                "• Taxa de acertos: 96.2%",
+                "• Variação entre participantes: SD = 0.31s"
+            ]
+            
+            stats_y = viz_rect.top + 50
+            for line in stats_text:
+                if line.startswith("• "):
+                    # Item de lista
+                    text = small_font.render(line, True, BLUE)
+                elif line.startswith("  "):
+                    # Subitem
+                    text = small_font.render(line, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                else:
+                    # Título ou linha em branco
+                    text = small_font.render(line, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                    if line and not line.isspace():
+                        text = font.render(line, True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+                        
+                screen.blit(text, (viz_rect.left + 30, stats_y))
+                stats_y += 25 if line else 15
+            
+            # Figura resumo simplificada
+            fig_rect = pygame.Rect(viz_rect.centerx + 70, viz_rect.top + 150, 
+                                  viz_rect.width // 2 - 90, viz_rect.height // 2 - 50)
+            pygame.draw.rect(screen, (250, 250, 250) if BACKGROUND_COLOR == WHITE else (30, 30, 30), fig_rect)
+            pygame.draw.rect(screen, BLACK if BACKGROUND_COLOR == WHITE else WHITE, fig_rect, 1)
+            
+            # Tempo das configurações repetidas e novas
+            bar_width = 60
+            bar_margin = 30
+            bar_height_novel = fig_rect.height * 0.7
+            bar_height_repeated = fig_rect.height * 0.56
+            
+            # Barra para novas
+            pygame.draw.rect(screen, RED, 
+                            (fig_rect.centerx - bar_width - bar_margin//2, 
+                             fig_rect.bottom - bar_height_novel, 
+                             bar_width, bar_height_novel))
+            
+            # Barra para repetidas
+            pygame.draw.rect(screen, BLUE, 
+                            (fig_rect.centerx + bar_margin//2, 
+                             fig_rect.bottom - bar_height_repeated, 
+                             bar_width, bar_height_repeated))
+            
+            # Rótulos
+            nov_label = small_font.render("Novas", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(nov_label, (fig_rect.centerx - bar_width - bar_margin//2 + bar_width//2 - nov_label.get_width()//2, 
+                                   fig_rect.bottom + 5))
+            
+            rep_label = small_font.render("Repetidas", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(rep_label, (fig_rect.centerx + bar_margin//2 + bar_width//2 - rep_label.get_width()//2, 
+                                   fig_rect.bottom + 5))
+            
+            # Valores
+            nov_value = small_font.render("1.72s", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(nov_value, (fig_rect.centerx - bar_width - bar_margin//2 + bar_width//2 - nov_value.get_width()//2, 
+                                   fig_rect.bottom - bar_height_novel - 20))
+            
+            rep_value = small_font.render("1.54s", True, BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(rep_value, (fig_rect.centerx + bar_margin//2 + bar_width//2 - rep_value.get_width()//2, 
+                                   fig_rect.bottom - bar_height_repeated - 20))
+            
+            # Interpretação
+            interp_rect = pygame.Rect(viz_rect.left + 20, viz_rect.bottom - 60, viz_rect.width - 40, 40)
+            pygame.draw.rect(screen, (235, 235, 255) if BACKGROUND_COLOR == WHITE else (40, 40, 60), interp_rect)
+            
+            interp_text = small_font.render("Interpretação: O aprendizado implícito é estatisticamente significativo (p < 0.05).", True, 
+                                         BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+            screen.blit(interp_text, (interp_rect.centerx - interp_text.get_width()//2, 
+                                    interp_rect.centery - interp_text.get_height()//2))
+        
+        # Controles para mudar a tab
+        controls_text = small_font.render("Navegue pelas tabs usando as setas ← →", True, 
+                                        BLACK if BACKGROUND_COLOR == WHITE else WHITE)
+        screen.blit(controls_text, (WIDTH//2 - controls_text.get_width()//2, 
+                                   main_area.bottom + 10))
+        
+        # Controlar com o teclado
+        for event in pygame.event.get():
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_RIGHT:
+                    self.demo_results_tab = (self.demo_results_tab + 1) % len(tabs)
+                elif event.key == pygame.K_LEFT:
+                    self.demo_results_tab = (self.demo_results_tab - 1) % len(tabs)
+        
+    def show_demo_end(self):
+        """Mostra a tela final do demo"""
+        text = font.render("Demonstração concluída!", True, GREEN)
+        screen.blit(text, (WIDTH//2 - text.get_width()//2, HEIGHT//2))
+          def apply_accessibility_settings(self):
+        """Aplica configurações de acessibilidade"""
+        global TARGET_COLOR, DISTRACTOR_COLOR, STIM_SIZE, TARGET_LINE_WIDTH, DISTRACTOR_LINE_WIDTH
+        global FONT_SIZE, SMALL_FONT_SIZE, TITLE_FONT_SIZE, font, small_font
+        
+        # Modo para daltônicos
+        colorblind_mode = config.get('COLORBLIND_MODE', False)
+        if colorblind_mode:
+            # Usar paleta amigável para daltônicos
+            colorblind_palette = config.get('COLORBLIND_PALETTE', 'deuteranopia')
+            
+            if colorblind_palette == 'deuteranopia':
+                # Deuteranopia (mais comum) - evitar vermelho/verde
+                TARGET_COLOR = (0, 0, 0)        # Preto
+                DISTRACTOR_COLOR = (120, 120, 120)  # Cinza
+                
+                # Substituir cores globais que podem ser problemáticas
+                global RED, GREEN
+                RED = (0, 0, 150)      # Substituir por azul escuro
+                GREEN = (200, 200, 0)  # Substituir por amarelo
+                
+            elif colorblind_palette == 'protanopia':
+                # Protanopia - outro tipo comum
+                TARGET_COLOR = (0, 0, 0)        # Preto  
+                DISTRACTOR_COLOR = (0, 0, 150)  # Azul escuro
+                
+            elif colorblind_palette == 'tritanopia':
+                # Tritanopia - menos comum, problema com azul/amarelo
+                TARGET_COLOR = (0, 0, 0)        # Preto
+                DISTRACTOR_COLOR = (150, 0, 150)  # Roxo
+                
+            # Aumentar contraste do grid para maior visibilidade
+            global GRID_COLOR
+            GRID_COLOR = (100, 100, 100)  # Cinza mais escuro para o grid
+            
+            # Usar linhas mais espessas por padrão
+            TARGET_LINE_WIDTH = 3
+            DISTRACTOR_LINE_WIDTH = 3
+        
+        # Modo de estímulos grandes
+        large_stimuli = config.get('LARGE_STIMULI_MODE', False)
+        if large_stimuli:
+            # Aumentar tamanho dos estímulos
+            scale_factor = config.get('LARGE_STIMULI_SCALE', 1.5)
+            STIM_SIZE = int(STIM_SIZE * scale_factor)
+            
+            # Aumentar espessura das linhas proporcionalmente
+            TARGET_LINE_WIDTH = max(2, int(TARGET_LINE_WIDTH * (scale_factor * 0.8)))
+            DISTRACTOR_LINE_WIDTH = max(2, int(DISTRACTOR_LINE_WIDTH * (scale_factor * 0.8)))
+        
+        # Modo de texto grande (para deficientes visuais)
+        large_text = config.get('LARGE_TEXT_MODE', False)
+        if large_text:
+            text_scale = config.get('LARGE_TEXT_SCALE', 1.3)
+            FONT_SIZE = int(FONT_SIZE * text_scale)
+            SMALL_FONT_SIZE = int(SMALL_FONT_SIZE * text_scale)
+            TITLE_FONT_SIZE = int(TITLE_FONT_SIZE * text_scale)
+            
+            # Recriar fontes com novos tamanhos
+            font = pygame.font.SysFont(config.get('FONT_NAME', 'Arial'), FONT_SIZE)
+            small_font = pygame.font.SysFont(config.get('FONT_NAME', 'Arial'), SMALL_FONT_SIZE)
+            
+        # Alto contraste (para baixa visão)
+        high_contrast = config.get('HIGH_CONTRAST_MODE', False)
+        if high_contrast:
+            global WHITE, BLACK, BACKGROUND_COLOR
+            WHITE = (255, 255, 255)  # Branco puro
+            BLACK = (0, 0, 0)        # Preto puro
+            BACKGROUND_COLOR = BLACK
+            TARGET_COLOR = (255, 255, 0)  # Amarelo (melhor contraste em fundo preto)
+            DISTRACTOR_COLOR = WHITE
+            GRID_COLOR = (80, 80, 80)  # Cinza escuro
